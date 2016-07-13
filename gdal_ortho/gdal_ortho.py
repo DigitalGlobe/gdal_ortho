@@ -18,7 +18,6 @@ DEM_LAT_MARGIN_DEG = 1.0
 DEM_LON_MARGIN_DEG = 1.0
 GDAL_CACHE_SIZE_MB = 8192
 WARP_CACHE_SIZE_MB = 2048
-WARP_NUM_THREADS = 8
 GEOID_PATH = os.path.join(os.path.dirname(os.path.realpath(__file__)),
                           "data",
                           "geoid_egm96-5_shifted.tif")
@@ -57,16 +56,21 @@ BAND_ALIASES = {
               "--resampling-method",
               type=str,
               default="cubic",
-              help="Resampling method for gdalwarp. Default cubic.")
+              help="Resampling method for gdalwarp. Default is cubic.")
 @click.option("-vrt/-novrt",
               "--create-vrts/--no-create-vrts",
               default=False,
               help="Create (or skip) creation of VRTs, grouping files of like bands. Default is to skip VRT creation.")
+@click.option("-nt",
+              "--num-threads",
+              type=int,
+              default=8,
+              help="Number of threads for gdalwarp. Default is 8.")
 @click.option("-t",
               "--tmpdir",
               type=click.Path(exists=True),
               default=None,
-              help="Local path for temporary files. (Default OS-specific)")
+              help="Local path for temporary files. (Default is OS-specific)")
 def gdal_ortho(input_dir,
                output_dir,
                target_srs,
@@ -75,6 +79,7 @@ def gdal_ortho(input_dir,
                apply_geoid,
                resampling_method,
                create_vrts,
+               num_threads,
                tmpdir):
     """Wrapper for orthorectification using GDAL utilities.
 
@@ -236,7 +241,8 @@ def gdal_ortho(input_dir,
                                dem_chip,
                                "-B",
                                geoid_chip,
-                               '--calc="A+B"',
+                               "--calc",
+                               "A+B",
                                "--outfile",
                                dem_plus_geoid_chip],
                               fail_msg="Failed to add geoid %s to DEM %s" % (geoid_chip, dem_chip),
@@ -265,7 +271,7 @@ def gdal_ortho(input_dir,
                            str(resampling_method),
                            "-multi",
                            "-wo",
-                           "NUM_THREADS=%s" % WARP_NUM_THREADS,
+                           "NUM_THREADS=%s" % num_threads,
                            "-to",
                            "RPC_DEM=%s" % dem_chip,
                            "-to",
@@ -334,7 +340,7 @@ def gdal_ortho(input_dir,
                            str(resampling_method),
                            "-multi",
                            "-wo",
-                           "NUM_THREADS=%s" % WARP_NUM_THREADS,
+                           "NUM_THREADS=%s" % num_threads,
                            "-to",
                            "RPC_HEIGHT=%s" % rpc_height,
                            "-co",
