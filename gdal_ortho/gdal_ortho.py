@@ -50,8 +50,9 @@ BAND_ALIASES = {
 @click.option("-geoid/-nogeoid",
               "--apply-geoid/--no-apply-geoid",
               default=True,
-              help="Apply (or don't apply) geoid to --rpc-dem input. (Refer to DEM's vertical datum, DEMs "
-              "referenced to ellipsoid need to be corrected to geoid.) Default is to apply geoid.")
+              help="Add (or don't add) geoid height to the --rpc-dem input. Refer to the DEM's vertical "
+              "datum, DEMs referenced to the geoid need to be corrected to measure from the ellipsoid. Default "
+              "is to add the geoid height.")
 @click.option("-rm",
               "--resampling-method",
               type=str,
@@ -206,7 +207,8 @@ def gdal_ortho(input_dir,
                     raise MetadataError("Failed to get DEM chip %s pixel size" % dem_chip)
                 logger.info("DEM pixel size is %.10f" % dem_pixel_size)
 
-                # Check whether the DEM needs to be adjusted to height above geoid (MSL)
+                # Check whether the DEM needs to be adjusted to height
+                # above ellipsoid
                 if apply_geoid:
                     # Subset geoid to match the DEM chip
                     geoid_chip = os.path.join(temp_dir, base_name + "_GEOID.tif")
@@ -277,7 +279,7 @@ def gdal_ortho(input_dir,
                            "-to",
                            "RPC_DEM=%s" % dem_chip,
                            "-to",
-                           "RPC_DEMINTERPOLATION=cubic",
+                           "RPC_DEMINTERPOLATION=bilinear",
                            "-co",
                            "TILED=YES",
                            input_file,
@@ -287,40 +289,7 @@ def gdal_ortho(input_dir,
                           cwd=temp_dir)
 
             else:
-                # No DEM, use strip average elevation. Find the
-                # average lat/lon.
-                avg_lat = (info.min_lat + info.max_lat) / 2.0
-                avg_lon = (info.min_lon + info.max_lon) / 2.0
-
-                # Get the geoid height at the average lat/lon. The
-                # geoid file has no SRS but its geotransform matches
-                # the lat/lon coordinate system, i.e. x=-180->+180,
-                # y=-90->+90.
-                logger.info("Getting geoid height at (lat, lon) = (%.10f, %.10f)" % \
-                            (avg_lat, avg_lon))
-                (stdout, stderr) = __run_cmd(["gdallocationinfo",
-                                              "-valonly",
-                                              "-b",
-                                              "1",
-                                              "-geoloc",
-                                              GEOID_PATH,
-                                              str(avg_lon),
-                                              str(avg_lat)],
-                                             fail_msg="Failed to get geoid height at (lat, lon) = (%.10f, %.10f)" % \
-                                             (avg_lat, avg_lon),
-                                             cwd=temp_dir,
-                                             capture_streams=True)
-                try:
-                    geoid_height = float(stdout)
-                except ValueError:
-                    raise CommandError("gdallocationinfo returned invalid geoid height: "
-                                       "stdout='%s', stderr='%s'" % (stdout, stderr))
-
-                # Determine RPC height
-                rpc_height = info.avg_hae + geoid_height
-                logger.info("Using RPC height %.10f above geoid" % rpc_height)
-
-                # Orthorectify
+                # Orthorectify using average height above ellipsoid
                 output_file_dir = os.path.dirname(output_file)
                 logger.info("Orthorectifying to SRS %s, %.5f meter pixels" % \
                             (target_srs, this_pixel_size))
@@ -344,7 +313,7 @@ def gdal_ortho(input_dir,
                            "-wo",
                            "NUM_THREADS=%s" % num_threads,
                            "-to",
-                           "RPC_HEIGHT=%s" % rpc_height,
+                           "RPC_HEIGHT=%s" % info.avg_hae,
                            "-co",
                            "TILED=YES",
                            input_file,
