@@ -95,6 +95,12 @@ def gdal_ortho(input_dir,
     logger = logging.getLogger(__name__)
     logger.setLevel(logging.INFO)
 
+    # Fix paths
+    input_dir = os.path.realpath(input_dir)
+    output_dir = os.path.realpath(output_dir)
+    if rpc_dem is not None:
+        rpc_dem = os.path.realpath(rpc_dem)
+
     # For the special "UTM" target spatial reference system, pixel
     # size should be in meters. Just copy the input pixel size.
     if target_srs.lower() == "utm":
@@ -192,7 +198,7 @@ def gdal_ortho(input_dir,
                 this_target_srs = target_srs
 
             # Check DEM input
-            if rpc_dem:
+            if rpc_dem is not None:
                 # Subset DEM for this input including some
                 # margin. NOTE: The DEM is assumed to be in a
                 # projection where pixels are measured in degrees.
