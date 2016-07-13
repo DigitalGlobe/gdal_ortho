@@ -35,7 +35,7 @@ BAND_ALIASES = {
               "--target-srs",
               type=str,
               required=True,
-              help="Target SRS for gdalwarp.")
+              help="Target SRS for gdalwarp. Specify 'UTM' to auto-determine an approximate EPSG code for a UTM zone.")
 @click.option("-ps",
               "--pixel-size",
               type=float,
@@ -95,39 +95,43 @@ def gdal_ortho(input_dir,
     logger = logging.getLogger(__name__)
     logger.setLevel(logging.INFO)
 
-    # Convert the input pixel size to the target spatial reference
-    # system. It's easier to specify the pixel size in meters even
-    # though the target SRS might require some other unit.
-    try:
-        # Set up a coordinate transformation from Web Mercator (which
-        # uses meters) to the target projection.
-        wm_ref = osr.SpatialReference()
-        wm_ref.ImportFromEPSG(3857)
-        tgt_ref = osr.SpatialReference()
-        tgt_ref.SetFromUserInput(str(target_srs))
-        xform_to_wm = osr.CoordinateTransformation(tgt_ref, wm_ref)
-        xform_to_tgt = osr.CoordinateTransformation(wm_ref, tgt_ref)
+    # For the special "UTM" target spatial reference system, pixel
+    # size should be in meters. Just copy the input pixel size.
+    if target_srs.lower() == "utm":
+        pixel_size_srs = pixel_size
+    else:
+        # Convert the input pixel size to the target spatial reference
+        # system. It's easier to specify the pixel size in meters even
+        # though the target SRS might require some other unit.
+        try:
+            # Set up a coordinate transformation from Web Mercator (which
+            # uses meters) to the target projection.
+            wm_ref = osr.SpatialReference()
+            wm_ref.ImportFromEPSG(3857)
+            tgt_ref = osr.SpatialReference()
+            tgt_ref.SetFromUserInput(str(target_srs))
+            xform_to_wm = osr.CoordinateTransformation(tgt_ref, wm_ref)
+            xform_to_tgt = osr.CoordinateTransformation(wm_ref, tgt_ref)
 
-        # Transform the target SRS origin into web mercator
-        origin = xform_to_wm.TransformPoint(0.0, 0.0)
+            # Transform the target SRS origin into web mercator
+            origin = xform_to_wm.TransformPoint(0.0, 0.0)
 
-        # Add the pixel size in meters to the origin. Use the Y
-        # coordinate because UTM zones are weird and their center is
-        # actually at x=500000. That could introduce error if the
-        # target SRS is a UTM zone.
-        pt = xform_to_tgt.TransformPoint(origin[0], origin[1] + pixel_size)
+            # Add the pixel size in meters to the origin. Use the Y
+            # coordinate because UTM zones are weird and their center is
+            # actually at x=500000. That could introduce error if the
+            # target SRS is a UTM zone.
+            pt = xform_to_tgt.TransformPoint(origin[0], origin[1] + pixel_size)
 
-        # The desired target SRS resolution is the point minus the
-        # origin, i.e. pt[1] - 0.0
-        pixel_size_srs = pt[1]
-        logger.info("Target SRS '%s' pixel size is %.10f" % \
-                    (target_srs, pixel_size_srs))
-
-    finally:
-        wm_ref = None
-        tgt_ref = None
-        xform_to_wm = None
-        xform_to_tgt = None
+            # The desired target SRS resolution is the point minus the
+            # origin, i.e. pt[1] - 0.0
+            pixel_size_srs = pt[1]
+            logger.info("Target SRS '%s' pixel size is %.10f" % \
+                        (target_srs, pixel_size_srs))
+        finally:
+            wm_ref = None
+            tgt_ref = None
+            xform_to_wm = None
+            xform_to_tgt = None
 
     # Walk the input directory looking for TIFs to orthorectify. Also
     # store metadata extracted from each TIF's IMD file. While
@@ -169,6 +173,23 @@ def gdal_ortho(input_dir,
             scale_ratio = info.avg_gsd / min_gsd
             this_pixel_size = pixel_size * scale_ratio
             this_pixel_size_srs = pixel_size_srs * scale_ratio
+
+            # Handle special "UTM" target SRS (NOTE: This is an
+            # approximation...)
+            if target_srs.lower() == "utm":
+                # Find the average location of the image
+                avg_lat = (info.min_lat + info.max_lat) / 2.0
+                avg_lon = (info.min_lon + info.max_lon) / 2.0
+
+                # Convert to EPSG UTM zone (north zones are
+                # EPSG:32601-EPSG:32660, south zones are
+                # EPSG:32701-EPSG:32760)
+                epsg_code = int(((avg_lon + 180.0) / 6.0) + 1) + 32600 # 326xx
+                if avg_lat < 0:
+                    epsg_code += 100 # 327xx
+                this_target_srs = "EPSG:%d" % epsg_code
+            else:
+                this_target_srs = target_srs
 
             # Check DEM input
             if rpc_dem:
@@ -256,7 +277,7 @@ def gdal_ortho(input_dir,
                 # Orthorectify
                 output_file_dir = os.path.dirname(output_file)
                 logger.info("Orthorectifying to SRS %s, %.5f meter pixels" % \
-                            (target_srs, this_pixel_size))
+                            (this_target_srs, this_pixel_size))
                 if not os.path.isdir(output_file_dir):
                     os.makedirs(output_file_dir)
                 __run_cmd(["gdalwarp",
@@ -266,7 +287,7 @@ def gdal_ortho(input_dir,
                            "-wm",
                            str(WARP_CACHE_SIZE_MB),
                            "-t_srs",
-                           str(target_srs),
+                           str(this_target_srs),
                            "-rpc",
                            "-tr",
                            str(this_pixel_size_srs),
@@ -292,7 +313,7 @@ def gdal_ortho(input_dir,
                 # Orthorectify using average height above ellipsoid
                 output_file_dir = os.path.dirname(output_file)
                 logger.info("Orthorectifying to SRS %s, %.5f meter pixels" % \
-                            (target_srs, this_pixel_size))
+                            (this_target_srs, this_pixel_size))
                 if not os.path.isdir(output_file_dir):
                     os.makedirs(output_file_dir)
                 __run_cmd(["gdalwarp",
@@ -302,7 +323,7 @@ def gdal_ortho(input_dir,
                            "-wm",
                            str(WARP_CACHE_SIZE_MB),
                            "-t_srs",
-                           str(target_srs),
+                           str(this_target_srs),
                            "-rpc",
                            "-tr",
                            str(this_pixel_size_srs),
@@ -319,7 +340,7 @@ def gdal_ortho(input_dir,
                            input_file,
                            output_file],
                           fail_msg="Failed to orthorectify %s using average height %.10f" % \
-                          (input_file, rpc_height),
+                          (input_file, info.avg_hae),
                           cwd=temp_dir)
 
             # Copy the input file's IMD to the output location
