@@ -5,7 +5,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from collections import defaultdict, namedtuple
+from concurrent.futures import ThreadPoolExecutor
 
 import click
 from osgeo import gdal, osr
@@ -25,6 +27,12 @@ BAND_ALIASES = {
     "MS1": "MS",
     "MS2": "MS"
 }
+
+# Initialize logging (root level WARNING, app level INFO)
+logging_format = "[%(asctime)s|%(levelname)s|%(name)s|%(lineno)d] %(message)s"
+logging.basicConfig(stream=sys.stdout, level=logging.WARNING, format=logging_format)
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 @click.command()
 @click.argument("input_dir", type=click.Path(exists=True))
@@ -70,11 +78,16 @@ BAND_ALIASES = {
               type=click.IntRange(1, 2**20),
               default=2048,
               help="Per-process memory size in MB for warping (default 2048)")
-@click.option("-nt",
-              "--num-threads",
+@click.option("-wt",
+              "--warp-threads",
               type=int,
               default=8,
               help="Number of threads for gdalwarp. Default is 8.")
+@click.option("-np",
+              "--num-parallel",
+              type=int,
+              default=2,
+              help="Number of images to orthorectify in parallel. Default is 2.")
 @click.option("-t",
               "--tmpdir",
               type=click.Path(exists=True),
@@ -90,7 +103,8 @@ def gdal_ortho(input_dir,
                create_vrts,
                gdal_cachemax,
                warp_memsize,
-               num_threads,
+               warp_threads,
+               num_parallel,
                tmpdir):
     """Wrapper for orthorectification using GDAL utilities.
 
@@ -98,12 +112,6 @@ def gdal_ortho(input_dir,
     from the execution environment.
 
     """
-
-    # Initialize logging (root level WARNING, app level INFO)
-    logging_format = "[%(asctime)s|%(levelname)s|%(name)s|%(lineno)d] %(message)s"
-    logging.basicConfig(stream=sys.stdout, level=logging.WARNING, format=logging_format)
-    logger = logging.getLogger(__name__)
-    logger.setLevel(logging.INFO)
 
     # Fix paths
     input_dir = os.path.realpath(input_dir)
@@ -173,228 +181,301 @@ def gdal_ortho(input_dir,
     logger.info("Found %d images to orthorectify, best GSD is %.10f" % \
                 (len(input_files), min_gsd))
 
+    # Create a pool of worker threads. Each worker thread will call
+    # out to GDAL utilities to do actual work.
+    worker_pool = ThreadPoolExecutorWithCallback(max_workers=num_parallel)
+
     # Create a working directory for temporary data
     temp_dir = tempfile.mkdtemp(dir=tmpdir)
     output_files_by_band = defaultdict(list)
     try:
-        # Loop over inputs
+        # Loop over inputs and submit jobs to worker pool
         for (input_file, info) in input_files.iteritems():
-            logger.info("Processing %s" % input_file)
-            base_name = os.path.splitext(os.path.basename(input_file))[0]
             output_file = os.path.join(output_dir,
                                        os.path.relpath(input_file, input_dir))
-
-            # Scale the pixel size according to this image's GSD
-            # compared to the maximum GSD of all the images.
-            scale_ratio = info.avg_gsd / min_gsd
-            this_pixel_size = pixel_size * scale_ratio
-            this_pixel_size_srs = pixel_size_srs * scale_ratio
-
-            # Handle special "UTM" target SRS (NOTE: This is an
-            # approximation...)
-            if target_srs.lower() == "utm":
-                # Find the average location of the image
-                avg_lat = (info.min_lat + info.max_lat) / 2.0
-                avg_lon = (info.min_lon + info.max_lon) / 2.0
-
-                # Convert to EPSG UTM zone (north zones are
-                # EPSG:32601-EPSG:32660, south zones are
-                # EPSG:32701-EPSG:32760)
-                epsg_code = int(((avg_lon + 180.0) / 6.0) + 1) + 32600 # 326xx
-                if avg_lat < 0:
-                    epsg_code += 100 # 327xx
-                this_target_srs = "EPSG:%d" % epsg_code
-            else:
-                this_target_srs = target_srs
-
-            # Check DEM input
-            if rpc_dem is not None:
-                # Subset DEM for this input including some
-                # margin. NOTE: The DEM is assumed to be in a
-                # projection where pixels are measured in degrees.
-                min_lat = info.min_lat - DEM_LAT_MARGIN_DEG
-                min_lon = info.min_lon - DEM_LON_MARGIN_DEG
-                max_lat = info.max_lat + DEM_LAT_MARGIN_DEG
-                max_lon = info.max_lon + DEM_LON_MARGIN_DEG
-                dem_chip = os.path.join(temp_dir, base_name + "_DEM.tif")
-                logger.info("Subsetting DEM, (lat, lon) = (%.10f, %.10f) - (%.10f, %.10f)" % \
-                            (min_lat, min_lon, max_lat, max_lon))
-                __run_cmd(["gdal_translate",
-                           "--config",
-                           "GDAL_CACHEMAX",
-                           str(gdal_cachemax),
-                           "-projwin",
-                           str(min_lon),
-                           str(max_lat),
-                           str(max_lon),
-                           str(min_lat),
-                           rpc_dem,
-                           dem_chip],
-                          fail_msg="Failed to subset DEM %s" % rpc_dem,
-                          cwd=temp_dir)
-
-                # Get the DEM's pixel resolution
-                dem_pixel_size = None
-                try:
-                    ds = gdal.Open(dem_chip)
-                    dem_pixel_size = ds.GetGeoTransform()[1]
-                finally:
-                    ds = None
-                if dem_pixel_size is None:
-                    raise MetadataError("Failed to get DEM chip %s pixel size" % dem_chip)
-                logger.info("DEM pixel size is %.10f" % dem_pixel_size)
-
-                # Check whether the DEM needs to be adjusted to height
-                # above ellipsoid
-                if apply_geoid:
-                    # Subset geoid to match the DEM chip
-                    geoid_chip = os.path.join(temp_dir, base_name + "_GEOID.tif")
-                    logger.info("Subsetting geoid, (lat, lon) = (%.10f, %.10f) - (%.10f, %.10f)" % \
-                                (min_lat, min_lon, max_lat, max_lon))
-                    __run_cmd(["gdalwarp",
-                               "--config",
-                               "GDAL_CACHEMAX",
-                               str(gdal_cachemax),
-                               "-wm",
-                               str(warp_memsize),
-                               "-t_srs",
-                               "EPSG:4326",
-                               "-te",
-                               str(min_lon),
-                               str(min_lat),
-                               str(max_lon),
-                               str(max_lat),
-                               "-tr",
-                               str(dem_pixel_size),
-                               str(dem_pixel_size),
-                               "-r",
-                               "bilinear",
-                               GEOID_PATH,
-                               geoid_chip],
-                              fail_msg="Failed to subset geoid %s" % GEOID_PATH,
-                              cwd=temp_dir)
-
-                    # Add the geoid to the DEM chip
-                    dem_plus_geoid_chip = os.path.join(temp_dir, base_name + "_DEM_PLUS_GEOID.tif")
-                    logger.info("Adding geoid to DEM")
-                    __run_cmd(["gdal_calc.py",
-                               "-A",
-                               dem_chip,
-                               "-B",
-                               geoid_chip,
-                               "--calc",
-                               "A+B",
-                               "--outfile",
-                               dem_plus_geoid_chip],
-                              fail_msg="Failed to add geoid %s to DEM %s" % (geoid_chip, dem_chip),
-                              cwd=temp_dir)
-                    dem_chip = dem_plus_geoid_chip
-
-                # Orthorectify
-                output_file_dir = os.path.dirname(output_file)
-                logger.info("Orthorectifying to SRS %s, %.5f meter pixels" % \
-                            (this_target_srs, this_pixel_size))
-                if not os.path.isdir(output_file_dir):
-                    os.makedirs(output_file_dir)
-                __run_cmd(["gdalwarp",
-                           "--config",
-                           "GDAL_CACHEMAX",
-                           str(gdal_cachemax),
-                           "-wm",
-                           str(warp_memsize),
-                           "-t_srs",
-                           str(this_target_srs),
-                           "-rpc",
-                           "-tr",
-                           str(this_pixel_size_srs),
-                           str(this_pixel_size_srs),
-                           "-r",
-                           str(resampling_method),
-                           "-multi",
-                           "-wo",
-                           "NUM_THREADS=%s" % num_threads,
-                           "-to",
-                           "RPC_DEM=%s" % dem_chip,
-                           "-to",
-                           "RPC_DEMINTERPOLATION=bilinear",
-                           "-co",
-                           "TILED=YES",
-                           input_file,
-                           output_file],
-                          fail_msg="Failed to orthorectify %s using DEM %s" % \
-                          (input_file, dem_chip),
-                          cwd=temp_dir)
-
-            else:
-                # Orthorectify using average height above ellipsoid
-                output_file_dir = os.path.dirname(output_file)
-                logger.info("Orthorectifying to SRS %s, %.5f meter pixels" % \
-                            (this_target_srs, this_pixel_size))
-                if not os.path.isdir(output_file_dir):
-                    os.makedirs(output_file_dir)
-                __run_cmd(["gdalwarp",
-                           "--config",
-                           "GDAL_CACHEMAX",
-                           str(gdal_cachemax),
-                           "-wm",
-                           str(warp_memsize),
-                           "-t_srs",
-                           str(this_target_srs),
-                           "-rpc",
-                           "-tr",
-                           str(this_pixel_size_srs),
-                           str(this_pixel_size_srs),
-                           "-r",
-                           str(resampling_method),
-                           "-multi",
-                           "-wo",
-                           "NUM_THREADS=%s" % num_threads,
-                           "-to",
-                           "RPC_HEIGHT=%s" % info.avg_hae,
-                           "-co",
-                           "TILED=YES",
-                           input_file,
-                           output_file],
-                          fail_msg="Failed to orthorectify %s using average height %.10f" % \
-                          (input_file, info.avg_hae),
-                          cwd=temp_dir)
-
-            # Copy the input file's IMD to the output location
-            shutil.copy(info.imd_file,
-                        os.path.join(output_file_dir,
-                                     os.path.basename(info.imd_file)))
+            worker_pool.submit(worker_thread,
+                               input_file,
+                               info,
+                               min_gsd,
+                               target_srs,
+                               pixel_size,
+                               pixel_size_srs,
+                               rpc_dem,
+                               apply_geoid,
+                               resampling_method,
+                               gdal_cachemax,
+                               warp_memsize,
+                               warp_threads,
+                               output_file,
+                               temp_dir)
 
             # Add the output file to the finished list
             output_files_by_band[info.band_id].append(output_file)
+
+        # Wait for all workers to finish
+        canceled = False
+        try:
+            while worker_pool.is_running():
+                time.sleep(1)
+        except KeyboardInterrupt:
+            canceled = True
+            logger.warn("Received interrupt, canceling pending jobs...")
+            num_canceled = worker_pool.cancel_all()
+            logger.warn("Canceled %d pending jobs" % num_canceled)
+            time.sleep(1)
+
+        # Wait for workers to finish
+        worker_pool.shutdown()
+
+        if create_vrts and not canceled:
+            # Create a VRT for each band
+            for (band_id, output_files) in output_files_by_band.iteritems():
+                # Check for a band alias to make a friendlier VRT name
+                ### TODO: Maybe use the individual part names as a template?
+                vrt_name = "ortho_%s.vrt" % band_id
+                for (orig_id, alias_id) in BAND_ALIASES.iteritems():
+                    if orig_id == band_id:
+                        vrt_name = "ortho_%s.vrt" % alias_id
+                        break
+
+                # Get relative paths to files from the output directory
+                relpaths = [os.path.relpath(f, output_dir) for f in output_files]
+
+                # Create VRT (paths are relative to output_dir)
+                logger.info("Creating band '%s' VRT %s" % (band_id, vrt_name))
+                __run_cmd(["gdalbuildvrt",
+                           "-srcnodata",
+                           "0",
+                           vrt_name] + relpaths,
+                          fail_msg="Failed to band %s VRT %s" % (band_id, vrt_name),
+                          cwd=output_dir)
 
     finally:
         # Delete the temporary directory and its contents
         shutil.rmtree(temp_dir)
 
-    if create_vrts:
-        # Create a VRT for each band
-        for (band_id, output_files) in output_files_by_band.iteritems():
-            # Check for a band alias to make a friendlier VRT name
-            vrt_name = "ortho_%s.vrt" % band_id
-            for (orig_id, alias_id) in BAND_ALIASES.iteritems():
-                if orig_id == band_id:
-                    vrt_name = "ortho_%s.vrt" % alias_id
-                    break
+def worker_thread(input_file,
+                  info,
+                  min_gsd,
+                  target_srs,
+                  pixel_size,
+                  pixel_size_srs,
+                  rpc_dem,
+                  apply_geoid,
+                  resampling_method,
+                  gdal_cachemax,
+                  warp_memsize,
+                  warp_threads,
+                  output_file,
+                  temp_dir):
+    """Orthorectifies a single image using GDAL utilties.
 
-            # Get relative paths to files from the output directory
-            relpaths = [os.path.relpath(f, output_dir) for f in output_files]
+    Args:
+        input_file: Path to input 1B TIF.
+        info: Tuple generated from __get_imd_info for the 1B TIF.
+        min_gsd: Minimum (best) ground sample distance for all TIFs in
+            the input directory, used to scale larger (worse) GSDs.
+        target_srs: Spatial reference system to warp into.
+        pixel_size: Requested output pixel size in meters.
+        pixel_size_srs: Requested output pixel size in SRS units.
+        rpc_dem: Path to DEM to use for warping.
+        apply_geoid: True to add geoid height to DEM, false to
+            skip. Necessary for DEMs that are measured from
+            geoid. (Most are.)
+        resampling_method: Resampling method to use for warping.
+        gdal_cachemax: Cache size to use for GDAL utilities.
+        warp_memsize: Extra cache size for warping.
+        warp_threads: Number of threads to use for warping.
+        output_file: Path to output orthorectified file.
+        temp_dir: Path to scratch directory for intermediate files.
 
-            # Create VRT (paths are relative to output_dir)
-            logger.info("Creating band '%s' VRT %s" % (band_id, vrt_name))
-            __run_cmd(["gdalbuildvrt",
-                       "-srcnodata",
-                       "0",
-                       vrt_name] + relpaths,
-                      fail_msg="Failed to band %s VRT %s" % (band_id, vrt_name),
-                      cwd=output_dir)
+    """
+
+    logger.info("Processing %s" % input_file)
+    base_name = os.path.splitext(os.path.basename(input_file))[0]
+
+    # Scale the pixel size according to this image's GSD
+    # compared to the maximum GSD of all the images.
+    scale_ratio = info.avg_gsd / min_gsd
+    this_pixel_size = pixel_size * scale_ratio
+    this_pixel_size_srs = pixel_size_srs * scale_ratio
+
+    # Handle special "UTM" target SRS (NOTE: This is an
+    # approximation...)
+    if target_srs.lower() == "utm":
+        # Find the average location of the image
+        avg_lat = (info.min_lat + info.max_lat) / 2.0
+        avg_lon = (info.min_lon + info.max_lon) / 2.0
+
+        # Convert to EPSG UTM zone (north zones are
+        # EPSG:32601-EPSG:32660, south zones are
+        # EPSG:32701-EPSG:32760)
+        epsg_code = int(((avg_lon + 180.0) / 6.0) + 1) + 32600 # 326xx
+        if avg_lat < 0:
+            epsg_code += 100 # 327xx
+        this_target_srs = "EPSG:%d" % epsg_code
+    else:
+        this_target_srs = target_srs
+
+    # Check DEM input
+    if rpc_dem is not None:
+        # Subset DEM for this input including some
+        # margin. NOTE: The DEM is assumed to be in a
+        # projection where pixels are measured in degrees.
+        min_lat = info.min_lat - DEM_LAT_MARGIN_DEG
+        min_lon = info.min_lon - DEM_LON_MARGIN_DEG
+        max_lat = info.max_lat + DEM_LAT_MARGIN_DEG
+        max_lon = info.max_lon + DEM_LON_MARGIN_DEG
+        dem_chip = os.path.join(temp_dir, base_name + "_DEM.tif")
+        logger.info("Subsetting DEM, (lat, lon) = (%.10f, %.10f) - (%.10f, %.10f)" % \
+                    (min_lat, min_lon, max_lat, max_lon))
+        __run_cmd(["gdal_translate",
+                   "--config",
+                   "GDAL_CACHEMAX",
+                   str(gdal_cachemax),
+                   "-projwin",
+                   str(min_lon),
+                   str(max_lat),
+                   str(max_lon),
+                   str(min_lat),
+                   rpc_dem,
+                   dem_chip],
+                  fail_msg="Failed to subset DEM %s" % rpc_dem,
+                  cwd=temp_dir)
+
+        # Get the DEM's pixel resolution
+        dem_pixel_size = None
+        try:
+            ds = gdal.Open(dem_chip)
+            dem_pixel_size = ds.GetGeoTransform()[1]
+        finally:
+            ds = None
+        if dem_pixel_size is None:
+            raise MetadataError("Failed to get DEM chip %s pixel size" % dem_chip)
+        logger.info("DEM pixel size is %.10f" % dem_pixel_size)
+
+        # Check whether the DEM needs to be adjusted to height
+        # above ellipsoid
+        if apply_geoid:
+            # Subset geoid to match the DEM chip
+            geoid_chip = os.path.join(temp_dir, base_name + "_GEOID.tif")
+            logger.info("Subsetting geoid, (lat, lon) = (%.10f, %.10f) - (%.10f, %.10f)" % \
+                        (min_lat, min_lon, max_lat, max_lon))
+            __run_cmd(["gdalwarp",
+                       "--config",
+                       "GDAL_CACHEMAX",
+                       str(gdal_cachemax),
+                       "-wm",
+                       str(warp_memsize),
+                       "-t_srs",
+                       "EPSG:4326",
+                       "-te",
+                       str(min_lon),
+                       str(min_lat),
+                       str(max_lon),
+                       str(max_lat),
+                       "-tr",
+                       str(dem_pixel_size),
+                       str(dem_pixel_size),
+                       "-r",
+                       "bilinear",
+                       GEOID_PATH,
+                       geoid_chip],
+                      fail_msg="Failed to subset geoid %s" % GEOID_PATH,
+                      cwd=temp_dir)
+
+            # Add the geoid to the DEM chip
+            dem_plus_geoid_chip = os.path.join(temp_dir, base_name + "_DEM_PLUS_GEOID.tif")
+            logger.info("Adding geoid to DEM")
+            __run_cmd(["gdal_calc.py",
+                       "-A",
+                       dem_chip,
+                       "-B",
+                       geoid_chip,
+                       "--calc",
+                       "A+B",
+                       "--outfile",
+                       dem_plus_geoid_chip],
+                      fail_msg="Failed to add geoid %s to DEM %s" % (geoid_chip, dem_chip),
+                      cwd=temp_dir)
+            dem_chip = dem_plus_geoid_chip
+
+        # Orthorectify
+        output_file_dir = os.path.dirname(output_file)
+        logger.info("Orthorectifying to SRS %s, %.5f meter pixels" % \
+                    (this_target_srs, this_pixel_size))
+        if not os.path.isdir(output_file_dir):
+            os.makedirs(output_file_dir)
+        __run_cmd(["gdalwarp",
+                   "--config",
+                   "GDAL_CACHEMAX",
+                   str(gdal_cachemax),
+                   "-wm",
+                   str(warp_memsize),
+                   "-t_srs",
+                   str(this_target_srs),
+                   "-rpc",
+                   "-tr",
+                   str(this_pixel_size_srs),
+                   str(this_pixel_size_srs),
+                   "-r",
+                   str(resampling_method),
+                   "-multi",
+                   "-wo",
+                   "NUM_THREADS=%s" % warp_threads,
+                   "-to",
+                   "RPC_DEM=%s" % dem_chip,
+                   "-to",
+                   "RPC_DEMINTERPOLATION=bilinear",
+                   "-co",
+                   "TILED=YES",
+                   input_file,
+                   output_file],
+                  fail_msg="Failed to orthorectify %s using DEM %s" % \
+                  (input_file, dem_chip),
+                  cwd=temp_dir)
+
+    else:
+        # Orthorectify using average height above ellipsoid
+        output_file_dir = os.path.dirname(output_file)
+        logger.info("Orthorectifying to SRS %s, %.5f meter pixels" % \
+                    (this_target_srs, this_pixel_size))
+        if not os.path.isdir(output_file_dir):
+            os.makedirs(output_file_dir)
+        __run_cmd(["gdalwarp",
+                   "--config",
+                   "GDAL_CACHEMAX",
+                   str(gdal_cachemax),
+                   "-wm",
+                   str(warp_memsize),
+                   "-t_srs",
+                   str(this_target_srs),
+                   "-rpc",
+                   "-tr",
+                   str(this_pixel_size_srs),
+                   str(this_pixel_size_srs),
+                   "-r",
+                   str(resampling_method),
+                   "-multi",
+                   "-wo",
+                   "NUM_THREADS=%s" % warp_threads,
+                   "-to",
+                   "RPC_HEIGHT=%s" % info.avg_hae,
+                   "-co",
+                   "TILED=YES",
+                   input_file,
+                   output_file],
+                  fail_msg="Failed to orthorectify %s using average height %.10f" % \
+                  (input_file, info.avg_hae),
+                  cwd=temp_dir)
+
+    # Copy the input file's IMD to the output location
+    shutil.copy(info.imd_file,
+                os.path.join(output_file_dir,
+                             os.path.basename(info.imd_file)))
 
 def __get_imd_info(imd_file):
-    """Parse an IMD file for metadata.
+    """Parses an IMD file for metadata.
 
     Args:
         imd_file: Path to IMD file to be parsed.
@@ -470,7 +551,7 @@ def __get_imd_info(imd_file):
                     avg_hae=sum(heights)/len(heights),
                     avg_gsd=sum(gsds)/len(gsds))
 
-def __run_cmd(args, fail_msg="Command failed", cwd=None, env=None, capture_streams=False):
+def __run_cmd(args, fail_msg="Command failed", cwd=None, env=None):
     # Get logger
     logger = logging.getLogger(__name__)
 
@@ -478,22 +559,64 @@ def __run_cmd(args, fail_msg="Command failed", cwd=None, env=None, capture_strea
     string_args = [str(a) for a in args]
     logger.info("Running command: %s" % " ".join(['"%s"' % a for a in string_args]))
 
-    # Set up streams (None means child process inherits from parent process)
-    stdout_val = subprocess.PIPE if capture_streams else None
-    stderr_val = subprocess.PIPE if capture_streams else None
-
     # Spawn child process and wait for it to complete
     p_obj = subprocess.Popen(string_args,
                              cwd=cwd,
-                             env=env,
-                             stdout=stdout_val,
-                             stderr=stderr_val)
-    (stdout, stderr) = p_obj.communicate()
-    retval = p_obj.returncode
+                             env=env)
+    retval = p_obj.wait()
     if retval != 0:
         raise CommandError("%s, returned non-zero exit status %d" % \
                            (fail_msg, retval))
-    return (stdout, stderr)
+
+class ThreadPoolExecutorWithCallback(ThreadPoolExecutor):
+    """ThreadPoolExecutor which automatically adds a callback to each future.
+
+    The added callback is used to catch exceptions from worker
+    processes. If an exception is caught, the callback sets a flag
+    that can be checked externally.
+
+    """
+
+    def __init__(self, *args, **kwargs):
+        super(ThreadPoolExecutorWithCallback, self).__init__(*args, **kwargs)
+        self.futures = set()
+        self.caught_exception = False
+
+    def submit(self, fn, *args, **kwargs):
+        future = super(ThreadPoolExecutorWithCallback, self).submit(fn, *args, **kwargs)
+        future.add_done_callback(self.callback)
+        self.futures.add(future)
+
+    def callback(self, future):
+        """Callback function for completed futures.
+
+        Args:
+            future: The future object to add the callback to.
+
+        """
+        self.futures.discard(future)
+
+        # Don't check for exceptions if canceled
+        if not future.cancelled():
+            exc = future.exception()
+            if exc is not None and not isinstance(exc, KeyboardInterrupt):
+                self.caught_exception = True
+                raise exc
+
+    def cancel_all(self):
+        """Attemps to cancel pending futures.
+
+        Returns the number of futures that were canceled.
+
+        """
+        num_canceled = 0
+        for future in list(self.futures):
+            if future.cancel():
+                num_canceled += 1
+        return num_canceled
+
+    def is_running(self):
+        return len(self.futures) > 0
 
 # Legacy entry point for calling script directly
 if __name__ == "__main__":
