@@ -262,7 +262,7 @@ def worker_thread(input_file,
     avg_lon = (info.min_lon + info.max_lon) / 2.0
     utm_epsg_code = int(((avg_lon + 180.0) / 6.0) + 1) + 32600 # 326xx
     if avg_lat < 0:
-        epsg_code += 100 # 327xx
+        utm_epsg_code += 100 # 327xx
 
     # Handle the special "UTM" target SRS
     if target_srs.lower() == "utm":
