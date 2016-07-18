@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 import re
 import shutil
@@ -119,44 +120,6 @@ def gdal_ortho(input_dir,
     if rpc_dem is not None:
         rpc_dem = os.path.realpath(rpc_dem)
 
-    # For the special "UTM" target spatial reference system, pixel
-    # size should be in meters. Just copy the input pixel size.
-    if target_srs.lower() == "utm":
-        pixel_size_srs = pixel_size
-    else:
-        # Convert the input pixel size to the target spatial reference
-        # system. It's easier to specify the pixel size in meters even
-        # though the target SRS might require some other unit.
-        try:
-            # Set up a coordinate transformation from Web Mercator (which
-            # uses meters) to the target projection.
-            wm_ref = osr.SpatialReference()
-            wm_ref.ImportFromEPSG(3857)
-            tgt_ref = osr.SpatialReference()
-            tgt_ref.SetFromUserInput(str(target_srs))
-            xform_to_wm = osr.CoordinateTransformation(tgt_ref, wm_ref)
-            xform_to_tgt = osr.CoordinateTransformation(wm_ref, tgt_ref)
-
-            # Transform the target SRS origin into web mercator
-            origin = xform_to_wm.TransformPoint(0.0, 0.0)
-
-            # Add the pixel size in meters to the origin. Use the Y
-            # coordinate because UTM zones are weird and their center is
-            # actually at x=500000. That could introduce error if the
-            # target SRS is a UTM zone.
-            pt = xform_to_tgt.TransformPoint(origin[0], origin[1] + pixel_size)
-
-            # The desired target SRS resolution is the point minus the
-            # origin, i.e. pt[1] - 0.0
-            pixel_size_srs = pt[1]
-            logger.info("Target SRS '%s' pixel size is %.10f" % \
-                        (target_srs, pixel_size_srs))
-        finally:
-            wm_ref = None
-            tgt_ref = None
-            xform_to_wm = None
-            xform_to_tgt = None
-
     # Walk the input directory looking for TIFs to orthorectify. Also
     # store metadata extracted from each TIF's IMD file. While
     # gathering image info, store the best (minimum) GSD. This will be
@@ -199,7 +162,6 @@ def gdal_ortho(input_dir,
                                min_gsd,
                                target_srs,
                                pixel_size,
-                               pixel_size_srs,
                                rpc_dem,
                                apply_geoid,
                                resampling_method,
@@ -259,7 +221,6 @@ def worker_thread(input_file,
                   min_gsd,
                   target_srs,
                   pixel_size,
-                  pixel_size_srs,
                   rpc_dem,
                   apply_geoid,
                   resampling_method,
@@ -277,7 +238,6 @@ def worker_thread(input_file,
             the input directory, used to scale larger (worse) GSDs.
         target_srs: Spatial reference system to warp into.
         pixel_size: Requested output pixel size in meters.
-        pixel_size_srs: Requested output pixel size in SRS units.
         rpc_dem: Path to DEM to use for warping.
         apply_geoid: True to add geoid height to DEM, false to
             skip. Necessary for DEMs that are measured from
@@ -294,28 +254,45 @@ def worker_thread(input_file,
     logger.info("Processing %s" % input_file)
     base_name = os.path.splitext(os.path.basename(input_file))[0]
 
+    # Find the average location of the image and calculate the UTM
+    # zone EPSG code. There are 60 zones around the globe. North zones
+    # are EPSG:32601-EPSG:32660, south zones are
+    # EPSG:32701-EPSG:32760.
+    avg_lat = (info.min_lat + info.max_lat) / 2.0
+    avg_lon = (info.min_lon + info.max_lon) / 2.0
+    utm_epsg_code = int(((avg_lon + 180.0) / 6.0) + 1) + 32600 # 326xx
+    if avg_lat < 0:
+        epsg_code += 100 # 327xx
+
+    # Handle the special "UTM" target SRS
+    if target_srs.lower() == "utm":
+        this_target_srs = "EPSG:%d" % utm_epsg_code
+    else:
+        this_target_srs = target_srs
+
+    # Check the unit of the target SRS and convert the pixel size if
+    # necessary
+    try:
+        srs = osr.SpatialReference()
+        srs.SetFromUserInput(str(this_target_srs))
+        unit = srs.GetAttrValue("UNIT")
+    finally:
+        srs = None
+    if unit.startswith("meter") or unit.startswith("metre"):
+        # SRS unit is meters, no conversion necessary
+        pixel_size_srs = pixel_size
+    elif unit.startswith("degree"):
+        # Convert to (approximate) degrees. 
+        pixel_size_srs = (pixel_size * 360.0) / (osr.SRS_WGS84_SEMIMAJOR * 2 * math.pi)
+    else:
+        raise MetadataError("Unsupported target SRS %s unit type %s" % \
+                            (this_target_srs, unit))
+
     # Scale the pixel size according to this image's GSD
     # compared to the maximum GSD of all the images.
     scale_ratio = info.avg_gsd / min_gsd
     this_pixel_size = pixel_size * scale_ratio
     this_pixel_size_srs = pixel_size_srs * scale_ratio
-
-    # Handle special "UTM" target SRS (NOTE: This is an
-    # approximation...)
-    if target_srs.lower() == "utm":
-        # Find the average location of the image
-        avg_lat = (info.min_lat + info.max_lat) / 2.0
-        avg_lon = (info.min_lon + info.max_lon) / 2.0
-
-        # Convert to EPSG UTM zone (north zones are
-        # EPSG:32601-EPSG:32660, south zones are
-        # EPSG:32701-EPSG:32760)
-        epsg_code = int(((avg_lon + 180.0) / 6.0) + 1) + 32600 # 326xx
-        if avg_lat < 0:
-            epsg_code += 100 # 327xx
-        this_target_srs = "EPSG:%d" % epsg_code
-    else:
-        this_target_srs = target_srs
 
     # Check DEM input
     if rpc_dem is not None:
