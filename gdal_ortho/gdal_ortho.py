@@ -662,7 +662,7 @@ def __get_dem_chip(base_name,
     min_lon = bounds[0] - DEM_LON_MARGIN_DEG
     max_lat = bounds[3] + DEM_LAT_MARGIN_DEG
     max_lon = bounds[2] + DEM_LON_MARGIN_DEG
-    dem_chip = os.path.join(temp_dir, base_name + "_DEM.tif")
+    dem_chip = os.path.join(dem_dir, base_name + "_DEM.tif")
     logger.info("Subsetting DEM, (lat, lon) = (%.10f, %.10f) - (%.10f, %.10f)" % \
                 (min_lat, min_lon, max_lat, max_lon))
     __run_cmd(["gdal_translate",
@@ -693,7 +693,7 @@ def __get_dem_chip(base_name,
     #  whether the DEM needs to be adjusted to height above ellipsoid
     if apply_geoid:
         # Subset geoid to match the DEM chip
-        geoid_chip = os.path.join(temp_dir, base_name + "_GEOID.tif")
+        geoid_chip = os.path.join(dem_dir, base_name + "_GEOID.tif")
         logger.info("Subsetting geoid, (lat, lon) = (%.10f, %.10f) - (%.10f, %.10f)" % \
                     (min_lat, min_lon, max_lat, max_lon))
         __run_cmd(["gdalwarp",
@@ -720,7 +720,7 @@ def __get_dem_chip(base_name,
                   cwd=dem_dir)
 
         # Add the geoid to the DEM chip
-        dem_plus_geoid_chip = os.path.join(temp_dir, base_name + "_DEM_PLUS_GEOID.tif")
+        dem_plus_geoid_chip = os.path.join(dem_dir, base_name + "_DEM_PLUS_GEOID.tif")
         logger.info("Adding geoid to DEM")
         __run_cmd(["gdal_calc.py",
                    "-A",
