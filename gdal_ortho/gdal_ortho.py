@@ -138,7 +138,7 @@ def gdal_ortho(input_dir,
     part_shps = defaultdict(dict)
     part_dirs = defaultdict(dict)
     part_info = defaultdict(dict)
-    for (path, dirs, files) in os.walk(input_dir):
+    for (path, dirs, files) in os.walk(input_dir, followlinks=True):
         # Look for GIS_FILES directory
         if os.path.basename(path).lower() == "gis_files":
             for f in files:
@@ -294,7 +294,7 @@ def gdal_ortho(input_dir,
         if create_vrts and not canceled:
             # Walk output directory looking for TIFs
             tifs_by_band = defaultdict(list)
-            for (path, dirs, files) in os.walk(output_dir):
+            for (path, dirs, files) in os.walk(output_dir, followlinks=True):
                 for f in files:
                     m_obj = re.search(r"\w+-(\w)\w+-\w+_p\d+.tif$", f, flags=re.IGNORECASE)
                     if m_obj is not None:
