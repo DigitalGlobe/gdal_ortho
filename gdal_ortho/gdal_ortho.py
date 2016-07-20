@@ -397,18 +397,18 @@ def worker_thread(part_num,
         # Transform the geometry into the target SRS
         src_crs = fiona.crs.from_epsg(4326)
         dst_crs = fiona.crs.from_string(target_srs_proj4)
-        band_geom = shapely.geometry.mapping(band_geom)
-        band_geom = fiona.transform.transform_geom(src_crs,
-                                                   dst_crs,
-                                                   band_geom)
-        band_geom = shapely.geometry.shape(band_geom)
+        band_geom_srs = shapely.geometry.mapping(band_geom)
+        band_geom_srs = fiona.transform.transform_geom(src_crs,
+                                                       dst_crs,
+                                                       band_geom_srs)
+        band_geom_srs = shapely.geometry.shape(band_geom_srs)
 
         # Calculate the extents to use given the ortho grid
         # origin. This ensures that all images are orthorectified into
         # an aligned grid. Expand the geometry bounds to the nearest
         # pixel, then calculate the extents as pixel offsets from the
         # origin.
-        bounds = band_geom.bounds
+        bounds = band_geom_srs.bounds
         min_pix_x = math.floor((bounds[0] - grid_origin[0]) / band_pixel_size)
         min_pix_y = math.floor((bounds[1] - grid_origin[1]) / band_pixel_size)
         max_pix_x = math.ceil((bounds[2] - grid_origin[0]) / band_pixel_size)
