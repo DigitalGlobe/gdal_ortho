@@ -45,6 +45,61 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 @click.command()
+@click.option("-aoi",
+              "--aoi",
+              required=True,
+              type=float,
+              nargs=4,
+              help="Area of interest (min_lon min_lat max_lon max_lat) to project.")
+@click.option("-srs",
+              "--srs",
+              required=True,
+              type=str,
+              help="Target SRS to project AOI into.")
+def aoi_to_srs(aoi, srs):
+    """Converts a lat/lon bounding box to a target SRS."""
+
+    # Handle special "UTM" target SRS
+    if srs.lower() == "utm":
+        utm_epsg_code = __get_utm_epsg_code((aoi[0] + aoi[2]) / 2.0,
+                                            (aoi[1] + aoi[3]) / 2.0)
+        srs = "EPSG:%d" % utm_epsg_code
+
+    # Log inputs
+    logger.info("Input bounds: %.10f %.10f %.10f %.10f" % \
+                (aoi[0], aoi[1], aoi[2], aoi[3]))
+    logger.info("Target SRS: %s" % srs)
+
+    # Create a PROJ.4 string of the target SRS for easy fiona calls
+    try:
+        ref = osr.SpatialReference()
+        ref.SetFromUserInput(str(srs))
+        srs_proj4 = ref.ExportToProj4()
+    finally:
+        ref = None
+
+    # Create a shapely geometry representing the AOI
+    aoi_geom = shapely.geometry.Polygon([(aoi[0], aoi[1]),  # LL
+                                         (aoi[0], aoi[3]),  # UL
+                                         (aoi[2], aoi[3]),  # UR
+                                         (aoi[2], aoi[1]),  # LR
+                                         (aoi[0], aoi[1])]) # LL
+
+    # Transform the geometry into the target SRS
+    src_crs = fiona.crs.from_epsg(4326)
+    dst_crs = fiona.crs.from_string(srs_proj4)
+    aoi_geom_srs = shapely.geometry.mapping(aoi_geom)
+    aoi_geom_srs = fiona.transform.transform_geom(src_crs,
+                                                  dst_crs,
+                                                  aoi_geom_srs)
+    aoi_geom_srs = shapely.geometry.shape(aoi_geom_srs)
+
+    # Report the bounds
+    bounds = aoi_geom_srs.bounds
+    logger.info("Output bounds: %.10f %.10f %.10f %.10f" % \
+                (bounds[0], bounds[1], bounds[2], bounds[3]))
+
+@click.command()
 @click.argument("input_dir", type=click.Path(exists=True))
 @click.argument("output_dir", type=click.Path())
 @click.option("-t_srs",
@@ -57,6 +112,13 @@ logger.setLevel(logging.INFO)
               type=float,
               default=None,
               help="Pixel resolution in units of the target SRS. (If omitted, native resolution is used.)")
+@click.option("-aoi",
+              "--aoi",
+              type=float,
+              nargs=4,
+              default=(),
+              help="Area of interest (min_x min_y max_x max_y) to orthorectify in units of the target SRS. (If "
+              "omitted, the full bounds of the input are used.)")
 @click.option("-rd",
               "--rpc-dem",
               type=click.Path(exists=True),
@@ -107,6 +169,7 @@ def gdal_ortho(input_dir,
                output_dir,
                target_srs,
                pixel_size,
+               aoi,
                rpc_dem,
                apply_geoid,
                resampling_method,
@@ -265,6 +328,7 @@ def gdal_ortho(input_dir,
                                target_srs_proj4,
                                grid_origin,
                                pixel_size,
+                               aoi,
                                rpc_dem,
                                apply_geoid,
                                resampling_method,
@@ -336,6 +400,7 @@ def worker_thread(part_num,
                   target_srs_proj4,
                   grid_origin,
                   pixel_size,
+                  aoi,
                   rpc_dem,
                   apply_geoid,
                   resampling_method,
@@ -358,6 +423,8 @@ def worker_thread(part_num,
         target_srs_proj4: PROJ.4 string of the target SRS.
         grid_origin: Tuple containing origin x and y of the ortho grid.
         pixel_size: Requested pixel size in target SRS units.
+        aoi: Tuple containing min x, min y, max x, and max y bounds of
+            AOI to orthorectify in target SRS units.
         rpc_dem: Path to DEM to use for warping.
         apply_geoid: True to add geoid height to DEM, false to
             skip. Necessary for DEMs that are measured from
@@ -402,6 +469,25 @@ def worker_thread(part_num,
                                                        dst_crs,
                                                        band_geom_srs)
         band_geom_srs = shapely.geometry.shape(band_geom_srs)
+
+        # If an AOI was provided, intersect it with the geometry to
+        # subset the output image
+        if aoi:
+            # Create a shapely geometry representing the AOI. The
+            # coordinates are in the target SRS already.
+            aoi_geom = shapely.geometry.Polygon([(aoi[0], aoi[1]),  # LL
+                                                 (aoi[0], aoi[3]),  # UL
+                                                 (aoi[2], aoi[3]),  # UR
+                                                 (aoi[2], aoi[1]),  # LR
+                                                 (aoi[0], aoi[1])]) # LL
+
+            # Intersect the AOI with the full geometry. If there is no
+            # intersection, there's no work to be done for this part.
+            band_geom_srs = band_geom_srs.intersection(aoi_geom)
+            if band_geom_srs.area == 0:
+                logger.info("Part P%03d band %s does not intersect AOI" % \
+                            (part_num, band))
+                continue
 
         # Calculate the extents to use given the ortho grid
         # origin. This ensures that all images are orthorectified into
@@ -807,4 +893,3 @@ class ThreadPoolExecutorWithCallback(ThreadPoolExecutor):
 # Legacy entry point for calling script directly
 if __name__ == "__main__":
     gdal_ortho()
-

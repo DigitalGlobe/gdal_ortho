@@ -5,10 +5,14 @@ setup(name="gdal_ortho",
       packages=find_packages(exclude=["test*"]),
       package_data={"gdal_ortho": ["data/*"]},
       install_requires=[
-          "Click"
+          "Click",
+          "fiona",
+          "futures",
+          "shapely"
       ],
       entry_points='''
           [console_scripts]
           gdal_ortho=gdal_ortho.gdal_ortho:gdal_ortho
+          aoi_to_srs=gdal_ortho.gdal_ortho:aoi_to_srs
       ''')
 
