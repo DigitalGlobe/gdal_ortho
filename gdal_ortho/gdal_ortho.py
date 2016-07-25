@@ -304,6 +304,13 @@ def gdal_ortho(input_dir,
                          abs(bounds[3] - bounds[1]))
         logger.info("Calculated pixel size in target SRS is %.10f" % pixel_size)
 
+    # Find average height above ellipsoid over all parts
+    hae_vals = [info.avg_hae
+                for band_info in part_info.itervalues()
+                for info in band_info.itervalues()]
+    avg_hae = sum(hae_vals) / len(hae_vals)
+    logger.info("Average height above ellipsoid is %.10f" % avg_hae)
+
     # Create a pool of worker threads. Each worker thread will call
     # out to GDAL utilities to do actual work.
     worker_pool = ThreadPoolExecutorWithCallback(max_workers=num_parallel)
@@ -330,6 +337,7 @@ def gdal_ortho(input_dir,
                                pixel_size,
                                aoi,
                                rpc_dem,
+                               avg_hae,
                                apply_geoid,
                                resampling_method,
                                gdal_cachemax,
@@ -402,6 +410,7 @@ def worker_thread(part_num,
                   pixel_size,
                   aoi,
                   rpc_dem,
+                  avg_hae,
                   apply_geoid,
                   resampling_method,
                   gdal_cachemax,
@@ -426,6 +435,7 @@ def worker_thread(part_num,
         aoi: Tuple containing min x, min y, max x, and max y bounds of
             AOI to orthorectify in target SRS units.
         rpc_dem: Path to DEM to use for warping.
+        avg_hae: Average height above ellipsoid for all input images.
         apply_geoid: True to add geoid height to DEM, false to
             skip. Necessary for DEMs that are measured from
             geoid. (Most are.)
@@ -439,14 +449,11 @@ def worker_thread(part_num,
 
     """
 
-    # Determine per-band pixel sizes and average height above ellipsoid
+    # Determine per-band pixel sizes
     min_gsd = min([info.avg_gsd for info in band_info.itervalues()])
     band_pixel_sizes = {}
-    avg_hae = 0.0
     for (band, info) in band_info.iteritems():
         band_pixel_sizes[band] = pixel_size * round(info.avg_gsd / min_gsd)
-        avg_hae += info.avg_hae
-    avg_hae /= len(band_info)
 
     # Loop over bands
     dem_chip = None
