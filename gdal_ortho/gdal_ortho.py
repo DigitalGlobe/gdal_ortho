@@ -32,10 +32,11 @@ UTM_ZONES_PATH = os.path.join(os.path.dirname(os.path.realpath(__file__)),
                               "data",
                               "UTM_Zone_Boundaries.geojson")
 BAND_ALIASES = {
-    "P": "PAN",
+    "P":     "PAN",
     "Multi": "MS",
-    "MS1": "MS",
-    "MS2": "MS"
+    "MS1":   "MS",
+    "MS2":   "MS",
+    "All-S": "SWIR"
 }
 
 # Initialize logging (root level WARNING, app level INFO)
@@ -119,6 +120,12 @@ def aoi_to_srs(aoi, srs):
               default=(),
               help="Area of interest (min_x min_y max_x max_y) to orthorectify in units of the target SRS. (If "
               "omitted, the full bounds of the input are used.)")
+@click.option("-b",
+              "--bands",
+              type=str,
+              default=None,
+              help="Comma-separated list of bands to process. Use identifiers PAN, MS, SWIR, e.g. 'PAN,MS'. (If "
+              "omitted, all bands are used.)")
 @click.option("-rd",
               "--rpc-dem",
               type=click.Path(exists=True),
@@ -170,6 +177,7 @@ def gdal_ortho(input_dir,
                target_srs,
                pixel_size,
                aoi,
+               bands,
                rpc_dem,
                apply_geoid,
                resampling_method,
@@ -196,6 +204,12 @@ def gdal_ortho(input_dir,
     if rpc_dem is not None:
         rpc_dem = os.path.realpath(rpc_dem)
 
+    # Parse band list
+    if bands is not None:
+        bands_to_process = set(re.split(r"\s+|\s*,\s*", bands))
+    else:
+        bands_to_process = None
+
     # Walk the input directory to find all the necessary files. Store
     # by part number then by band.
     part_shps = defaultdict(dict)
@@ -217,13 +231,32 @@ def gdal_ortho(input_dir,
         if m_obj is not None:
             part_num = int(m_obj.group(1))
             band_char = m_obj.group(2)[0]
-            part_dirs[part_num][band_char] = path
 
             # Look for IMD files
+            imd_info = None
             for f in files:
                 if os.path.splitext(f)[1].lower() == ".imd":
-                    part_info[part_num][band_char] = __parse_imd(os.path.join(path, f))
-    logger.info("Found %d parts to process" % len(part_dirs))
+                    imd_info = __parse_imd(os.path.join(path, f))
+            if imd_info is None:
+                logger.warn("Part directory %s has no IMD file" % path)
+            else:
+                # Check band ID
+                if imd_info.band_id not in BAND_ALIASES:
+                    logger.warn("IMD file %s contains unknown bandId %s" % \
+                                (imd_info.imd_file, imd_info.band_id))
+                else:
+                    band_alias = BAND_ALIASES[imd_info.band_id]
+                    if bands_to_process is not None and \
+                       band_alias not in bands_to_process:
+                        logger.info("Skipping part directory %s (%s)" % \
+                                    (path, band_alias))
+                    else:
+                        # Save this part directory
+                        part_dirs[part_num][band_char] = path
+                        part_info[part_num][band_char] = imd_info
+                        logger.info("Found part directory %s (%s)" % \
+                                    (path, band_alias))
+    logger.info("Found %d part directories" % len(part_dirs))
 
     # Load all the shapefiles into one big geometry
     geoms = []
@@ -308,7 +341,10 @@ def gdal_ortho(input_dir,
     hae_vals = [info.avg_hae
                 for band_info in part_info.itervalues()
                 for info in band_info.itervalues()]
-    avg_hae = sum(hae_vals) / len(hae_vals)
+    if hae_vals:
+        avg_hae = sum(hae_vals) / len(hae_vals)
+    else:
+        avg_hae = 0.0
     logger.info("Average height above ellipsoid is %.10f" % avg_hae)
 
     # Create a pool of worker threads. Each worker thread will call
@@ -646,6 +682,7 @@ def __parse_imd(imd_file):
     Returns a namedtuple with the following fields (NOTE: each field
     is stored as a string):
         imd_file: Path to IMD file.
+        band_id: Band identifier reported by IMD file.
         avg_hae: Average height above ellipsoid of image.
         avg_gsd: Average ground sample distance of image.
 
@@ -654,6 +691,7 @@ def __parse_imd(imd_file):
     # Create return type
     InfoType = namedtuple("InfoType",
                           ["imd_file",
+                           "band_id",
                            "avg_hae",
                            "avg_gsd"])
 
@@ -663,6 +701,7 @@ def __parse_imd(imd_file):
 
     # Create a dict of all the values to read
     params = {
+        "bandId": [],
         "ULHAE": [],
         "URHAE": [],
         "LRHAE": [],
@@ -679,7 +718,11 @@ def __parse_imd(imd_file):
     heights = [float(val) for param in ["ULHAE", "URHAE", "LRHAE", "LLHAE"] for val in params[param]]
     gsds = [float(val) for val in params["meanProductGSD"]]
 
+    # Get band ID (should only be one)
+    band_id = params["bandId"][0]
+
     return InfoType(imd_file=imd_file,
+                    band_id=band_id,
                     avg_hae=sum(heights)/len(heights),
                     avg_gsd=sum(gsds)/len(gsds))
 
