@@ -23,8 +23,8 @@ class InputError(Exception): pass
 class CommandError(Exception): pass
 
 # Constants
-DEM_LAT_MARGIN_DEG = 1.0
-DEM_LON_MARGIN_DEG = 1.0
+DEM_LAT_MARGIN_DEG = 0.1
+DEM_LON_MARGIN_DEG = 0.1
 GEOID_PATH = os.path.join(os.path.dirname(os.path.realpath(__file__)),
                           "data",
                           "geoid_egm96-5_shifted.tif")
