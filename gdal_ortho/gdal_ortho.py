@@ -150,9 +150,9 @@ def aoi_to_srs(aoi, srs):
 @click.option("-et",
               "--error-threshold",
               type=float,
-              default=None,
-              help="Error threshold in pixels for gdalwarp. Set to 0 to use the exact transformer. See gdalwarp for "
-              "default value.")
+              default=0.01,
+              help="Error threshold in pixels for gdalwarp. Set to 0 to use the exact transformer. Default is "
+              "0.01 pixels.")
 @click.option("-vrt/-novrt",
               "--create-vrts/--no-create-vrts",
               default=False,
@@ -612,8 +612,6 @@ def worker_thread(part_num,
                 if not os.path.isdir(output_file_dir):
                     os.makedirs(output_file_dir)
                 args = ["gdalwarp"]
-                if error_threshold is not None:
-                    args += ["-et", str(error_threshold)]
                 args += ["--config", "GDAL_CACHEMAX", str(gdal_cachemax)]
                 args += ["-wm", str(warp_memsize)]
                 args += ["-t_srs", str(target_srs)]
@@ -621,6 +619,7 @@ def worker_thread(part_num,
                 args += ["-te", str(min_extent_x), str(min_extent_y), str(max_extent_x), str(max_extent_y)]
                 args += ["-tr", str(band_pixel_size), str(band_pixel_size)]
                 args += ["-r", str(resampling_method)]
+                args += ["-et", str(error_threshold)]
                 args += ["-multi"]
                 args += ["-wo", "NUM_THREADS=%s" % warp_threads]
                 args += ["-to", "RPC_DEM=%s" % dem_chip]
@@ -654,8 +653,6 @@ def worker_thread(part_num,
                 if not os.path.isdir(output_file_dir):
                     os.makedirs(output_file_dir)
                 args = ["gdalwarp"]
-                if error_threshold is not None:
-                    args += ["-et", str(error_threshold)]
                 args += ["--config", "GDAL_CACHEMAX", str(gdal_cachemax)]
                 args += ["-wm", str(warp_memsize)]
                 args += ["-t_srs", str(target_srs)]
@@ -663,6 +660,7 @@ def worker_thread(part_num,
                 args += ["-te", str(min_extent_x), str(min_extent_y), str(max_extent_x), str(max_extent_y)]
                 args += ["-tr", str(band_pixel_size), str(band_pixel_size)]
                 args += ["-r", str(resampling_method)]
+                args += ["-et", str(error_threshold)]
                 args += ["-multi"]
                 args += ["-wo", "NUM_THREADS=%s" % warp_threads]
                 args += ["-to", "RPC_HEIGHT=%s" % avg_hae]
