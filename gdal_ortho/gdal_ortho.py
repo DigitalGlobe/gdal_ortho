@@ -25,7 +25,8 @@ from run_cmd import run_cmd
 class InputError(Exception): pass
 
 # Constants
-DEM_MARGIN_DEG = 0.25
+DEM_FETCH_MARGIN_DEG = 0.30
+DEM_CHIP_MARGIN_DEG = 0.25
 UTM_ZONES_PATH = os.path.join(os.path.dirname(os.path.realpath(__file__)),
                               "data",
                               "UTM_Zone_Boundaries.geojson")
@@ -374,7 +375,7 @@ def gdal_ortho(input_dir,
             # The use_hae flag is not set and no DEM path was
             # specified on the command line. Try to copy from S3.
             dem_vrt = os.path.join(temp_dir, "dgdem_" + str(uuid.uuid4()) + ".vrt")
-            if dem.fetch_dgdem_tiles(full_geom, dem_vrt, DEM_MARGIN_DEG):
+            if dem.fetch_dgdem_tiles(full_geom.buffer(DEM_FETCH_MARGIN_DEG), dem_vrt):
                 logger.info("Downloaded DEM tiles, using VRT %s" % dem_vrt)
                 rpc_dem = dem_vrt
             else:
@@ -595,7 +596,7 @@ def worker_thread(part_num,
                                               gdal_cachemax,
                                               warp_memsize,
                                               warp_threads,
-                                              DEM_MARGIN_DEG)
+                                              DEM_CHIP_MARGIN_DEG)
 
             # Orthorectify all TIFs in the input directory
             for input_file in tif_list:
