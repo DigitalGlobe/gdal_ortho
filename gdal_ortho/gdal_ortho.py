@@ -4,10 +4,10 @@ import math
 import os
 import re
 import shutil
-import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from collections import defaultdict, namedtuple
 from concurrent.futures import ThreadPoolExecutor
 
@@ -17,17 +17,15 @@ import fiona.crs
 import fiona.transform
 import shapely.geometry
 import shapely.ops
-from osgeo import gdal, osr
+from osgeo import osr
+
+import dem
+from run_cmd import run_cmd
 
 class InputError(Exception): pass
-class CommandError(Exception): pass
 
 # Constants
-DEM_LAT_MARGIN_DEG = 0.1
-DEM_LON_MARGIN_DEG = 0.1
-GEOID_PATH = os.path.join(os.path.dirname(os.path.realpath(__file__)),
-                          "data",
-                          "geoid_egm96-5_shifted.tif")
+DEM_MARGIN_DEG = 0.25
 UTM_ZONES_PATH = os.path.join(os.path.dirname(os.path.realpath(__file__)),
                               "data",
                               "UTM_Zone_Boundaries.geojson")
@@ -103,7 +101,7 @@ def aoi_to_srs(aoi, srs):
 @click.command()
 @click.argument("input_dir", type=click.Path(exists=True))
 @click.argument("output_dir", type=click.Path())
-@click.option("-t_srs",
+@click.option("-srs",
               "--target-srs",
               type=str,
               required=True,
@@ -126,12 +124,17 @@ def aoi_to_srs(aoi, srs):
               default=None,
               help="Comma-separated list of bands to process. Use identifiers PAN, MS, SWIR, e.g. 'PAN,MS'. (If "
               "omitted, all bands are used.)")
-@click.option("-rd",
+@click.option("-dem",
               "--rpc-dem",
-              type=click.Path(exists=True),
+              type=str,
               default=None,
-              help="Path to DEM for RPC calculations. (If omitted, image average elevation is used.) NOTE: "
-              "The DEM is assumed to be in a projection where pixels are measured in degrees.")
+              help="Path to DEM for orthorectification. (If omitted, the worldwide DEM stored in s3://dgdem is used. "
+              "Contact the GBDX team for acces to the bucket.)")
+@click.option("--use-hae",
+              is_flag=True,
+              default=False,
+              help="Use image average height above ellipsoid instead of a DEM for orthorectification. Default is "
+              "to use DEM.")
 @click.option("-geoid/-nogeoid",
               "--apply-geoid/--no-apply-geoid",
               default=True,
@@ -143,6 +146,12 @@ def aoi_to_srs(aoi, srs):
               type=str,
               default="cubic",
               help="Resampling method for gdalwarp. Default is cubic.")
+@click.option("-et",
+              "--error-threshold",
+              type=float,
+              default=None,
+              help="Error threshold in pixels for gdalwarp. Set to 0 to use the exact transformer. See gdalwarp for "
+              "default value.")
 @click.option("-vrt/-novrt",
               "--create-vrts/--no-create-vrts",
               default=False,
@@ -151,12 +160,12 @@ def aoi_to_srs(aoi, srs):
               "--gdal-cachemax",
               type=click.IntRange(1, 2**20),
               default=8192,
-              help="Per-process memory size in MB for GDAL cache (default 8192)")
+              help="Per-process memory size in MB for GDAL cache. Default is 8192 MB.")
 @click.option("-wm",
               "--warp-memsize",
               type=click.IntRange(1, 2**20),
               default=2048,
-              help="Per-process memory size in MB for warping (default 2048)")
+              help="Per-process memory size in MB for warping. Default is 2048 MB.")
 @click.option("-wt",
               "--warp-threads",
               type=int,
@@ -171,7 +180,7 @@ def aoi_to_srs(aoi, srs):
               "--tmpdir",
               type=click.Path(exists=True),
               default=None,
-              help="Local path for temporary files. (Default is OS-specific)")
+              help="Local path for temporary files. Default is OS-specific.")
 def gdal_ortho(input_dir,
                output_dir,
                target_srs,
@@ -179,8 +188,10 @@ def gdal_ortho(input_dir,
                aoi,
                bands,
                rpc_dem,
+               use_hae,
                apply_geoid,
                resampling_method,
+               error_threshold,
                create_vrts,
                gdal_cachemax,
                warp_memsize,
@@ -209,6 +220,10 @@ def gdal_ortho(input_dir,
         bands_to_process = set(re.split(r"\s+|\s*,\s*", bands))
     else:
         bands_to_process = None
+
+    # Override DEM input if using height above ellipsoid
+    if use_hae:
+        rpc_dem = None
 
     # Walk the input directory to find all the necessary files. Store
     # by part number then by band.
@@ -354,6 +369,19 @@ def gdal_ortho(input_dir,
     # Create a working directory for temporary data
     temp_dir = tempfile.mkdtemp(dir=tmpdir)
     try:
+        # Check whether to download DEM data from S3
+        if not use_hae and rpc_dem is None:
+            # The use_hae flag is not set and no DEM path was
+            # specified on the command line. Try to copy from S3.
+            dem_vrt = os.path.join(temp_dir, "dgdem_" + str(uuid.uuid4()) + ".vrt")
+            if dem.fetch_dgdem_tiles(full_geom, dem_vrt, DEM_MARGIN_DEG):
+                logger.info("Downloaded DEM tiles, using VRT %s" % dem_vrt)
+                rpc_dem = dem_vrt
+            else:
+                logger.warn("Failed to download DEM tiles from S3, reverting to "
+                            "average height above ellipsoid")
+                use_hae = True
+
         # Loop over parts and submit jobs to worker pool
         for part_num in part_dirs.iterkeys():
             # Extract bands for this part
@@ -376,6 +404,7 @@ def gdal_ortho(input_dir,
                                avg_hae,
                                apply_geoid,
                                resampling_method,
+                               error_threshold,
                                gdal_cachemax,
                                warp_memsize,
                                warp_threads,
@@ -425,12 +454,12 @@ def gdal_ortho(input_dir,
 
                 # Create VRT (paths are relative to output_dir)
                 logger.info("Creating band %s VRT %s" % (band_char, vrt_name))
-                __run_cmd(["gdalbuildvrt",
-                           "-srcnodata",
-                           "0",
-                           vrt_name] + relpaths,
-                          fail_msg="Failed to create band %s VRT %s" % (band_char, vrt_name),
-                          cwd=output_dir)
+                run_cmd(["gdalbuildvrt",
+                         "-srcnodata",
+                         "0",
+                         vrt_name] + relpaths,
+                        fail_msg="Failed to create band %s VRT %s" % (band_char, vrt_name),
+                        cwd=output_dir)
 
     finally:
         # Delete the temporary directory and its contents
@@ -449,6 +478,7 @@ def worker_thread(part_num,
                   avg_hae,
                   apply_geoid,
                   resampling_method,
+                  error_threshold,
                   gdal_cachemax,
                   warp_memsize,
                   warp_threads,
@@ -476,6 +506,7 @@ def worker_thread(part_num,
             skip. Necessary for DEMs that are measured from
             geoid. (Most are.)
         resampling_method: Resampling method to use for warping.
+        error_threshold: Error threshold in pixels for gdalwarp.
         gdal_cachemax: Cache size to use for GDAL utilities.
         warp_memsize: Extra cache size for warping.
         warp_threads: Number of threads to use for warping.
@@ -556,14 +587,15 @@ def worker_thread(part_num,
         if rpc_dem is not None:
             # Get the DEM chip if it hasn't already been created
             if dem_chip is None:
-                dem_chip = __get_dem_chip(os.path.basename(band_input_dir),
-                                          temp_dir,
-                                          band_geom,
-                                          rpc_dem,
-                                          apply_geoid,
-                                          gdal_cachemax,
-                                          warp_memsize,
-                                          warp_threads)
+                dem_chip = dem.local_dem_chip(os.path.basename(band_input_dir),
+                                              temp_dir,
+                                              band_geom,
+                                              rpc_dem,
+                                              apply_geoid,
+                                              gdal_cachemax,
+                                              warp_memsize,
+                                              warp_threads,
+                                              DEM_MARGIN_DEG)
 
             # Orthorectify all TIFs in the input directory
             for input_file in tif_list:
@@ -578,41 +610,27 @@ def worker_thread(part_num,
                 output_file_dir = os.path.dirname(output_file)
                 if not os.path.isdir(output_file_dir):
                     os.makedirs(output_file_dir)
-                __run_cmd(["gdalwarp",
-                           "--config",
-                           "GDAL_CACHEMAX",
-                           str(gdal_cachemax),
-                           "-wm",
-                           str(warp_memsize),
-                           "-t_srs",
-                           str(target_srs),
-                           "-rpc",
-                           "-et",
-                           "0",
-                           "-te",
-                           str(min_extent_x),
-                           str(min_extent_y),
-                           str(max_extent_x),
-                           str(max_extent_y),
-                           "-tr",
-                           str(band_pixel_size),
-                           str(band_pixel_size),
-                           "-r",
-                           str(resampling_method),
-                           "-multi",
-                           "-wo",
-                           "NUM_THREADS=%s" % warp_threads,
-                           "-to",
-                           "RPC_DEM=%s" % dem_chip,
-                           "-to",
-                           "RPC_DEMINTERPOLATION=bilinear",
-                           "-co",
-                           "TILED=YES",
-                           input_file,
-                           output_file],
-                          fail_msg="Failed to orthorectify %s using DEM %s" % \
-                          (input_file, dem_chip),
-                          cwd=temp_dir)
+                args = ["gdalwarp"]
+                if error_threshold is not None:
+                    args += ["-et", str(error_threshold)]
+                args += ["--config", "GDAL_CACHEMAX", str(gdal_cachemax)]
+                args += ["-wm", str(warp_memsize)]
+                args += ["-t_srs", str(target_srs)]
+                args += ["-rpc"]
+                args += ["-te", str(min_extent_x), str(min_extent_y), str(max_extent_x), str(max_extent_y)]
+                args += ["-tr", str(band_pixel_size), str(band_pixel_size)]
+                args += ["-r", str(resampling_method)]
+                args += ["-multi"]
+                args += ["-wo", "NUM_THREADS=%s" % warp_threads]
+                args += ["-to", "RPC_DEM=%s" % dem_chip]
+                args += ["-to", "RPC_DEMINTERPOLATION=bilinear"]
+                args += ["-co", "TILED=YES"]
+                args += [input_file]
+                args += [output_file]
+                run_cmd(args,
+                        fail_msg="Failed to orthorectify %s using DEM %s" % \
+                        (input_file, dem_chip),
+                        cwd=temp_dir)
 
                 # Copy the input file's IMD to the output location
                 shutil.copy(imd_filename,
@@ -634,39 +652,26 @@ def worker_thread(part_num,
                 output_file_dir = os.path.dirname(output_file)
                 if not os.path.isdir(output_file_dir):
                     os.makedirs(output_file_dir)
-                __run_cmd(["gdalwarp",
-                           "--config",
-                           "GDAL_CACHEMAX",
-                           str(gdal_cachemax),
-                           "-wm",
-                           str(warp_memsize),
-                           "-t_srs",
-                           str(target_srs),
-                           "-rpc",
-                           "-et",
-                           "0",
-                           "-te",
-                           str(min_extent_x),
-                           str(min_extent_y),
-                           str(max_extent_x),
-                           str(max_extent_y),
-                           "-tr",
-                           str(band_pixel_size),
-                           str(band_pixel_size),
-                           "-r",
-                           str(resampling_method),
-                           "-multi",
-                           "-wo",
-                           "NUM_THREADS=%s" % warp_threads,
-                           "-to",
-                           "RPC_HEIGHT=%s" % avg_hae,
-                           "-co",
-                           "TILED=YES",
-                           input_file,
-                           output_file],
-                          fail_msg="Failed to orthorectify %s using average height %.10f" % \
-                          (input_file, avg_hae),
-                          cwd=temp_dir)
+                args = ["gdalwarp"]
+                if error_threshold is not None:
+                    args += ["-et", str(error_threshold)]
+                args += ["--config", "GDAL_CACHEMAX", str(gdal_cachemax)]
+                args += ["-wm", str(warp_memsize)]
+                args += ["-t_srs", str(target_srs)]
+                args += ["-rpc"]
+                args += ["-te", str(min_extent_x), str(min_extent_y), str(max_extent_x), str(max_extent_y)]
+                args += ["-tr", str(band_pixel_size), str(band_pixel_size)]
+                args += ["-r", str(resampling_method)]
+                args += ["-multi"]
+                args += ["-wo", "NUM_THREADS=%s" % warp_threads]
+                args += ["-to", "RPC_HEIGHT=%s" % avg_hae]
+                args += ["-co", "TILED=YES"]
+                args += [input_file]
+                args += [output_file]
+                run_cmd(args,
+                        fail_msg="Failed to orthorectify %s using average height %.10f" % \
+                        (input_file, avg_hae),
+                        cwd=temp_dir)
 
                 # Copy the input file's IMD to the output location
                 shutil.copy(imd_filename,
@@ -767,132 +772,6 @@ def __get_utm_epsg_code(lat, lon):
     else:
         base_epsg = 32700
     return base_epsg + int(zone_num)
-
-def __get_dem_chip(base_name,
-                   dem_dir,
-                   bbox,
-                   rpc_dem,
-                   apply_geoid,
-                   gdal_cachemax,
-                   warp_memsize,
-                   warp_threads):
-    """Subsets the input DEM for a specific area.
-
-    Args:
-        base_name: Base name of generated files.
-        dem_dir: Path to destination directory for DEM chip.
-        bbox: Shapely geometry containing area to extract.
-        rpc_dem: Path to overall DEM.
-        apply_geoid: True to add geoid height to DEM, false to
-            skip. Necessary for DEMs that are measured from
-            geoid. (Most are.)
-        gdal_cachemax: Cache size to use for GDAL utilities.
-        warp_memsize: Extra cache size for warping.
-        warp_threads: Number of threads to use for warping.
-
-    Returns the path to the DEM chip.
-
-    """
-
-    # Subset DEM for this input including some margin. NOTE: The DEM
-    # is assumed to be in a projection where pixels are measured in
-    # degrees.
-    bounds = bbox.bounds
-    min_lat = bounds[1] - DEM_LAT_MARGIN_DEG
-    min_lon = bounds[0] - DEM_LON_MARGIN_DEG
-    max_lat = bounds[3] + DEM_LAT_MARGIN_DEG
-    max_lon = bounds[2] + DEM_LON_MARGIN_DEG
-    dem_chip = os.path.join(dem_dir, base_name + "_DEM.tif")
-    logger.info("Subsetting DEM, (lat, lon) = (%.10f, %.10f) - (%.10f, %.10f)" % \
-                (min_lat, min_lon, max_lat, max_lon))
-    __run_cmd(["gdal_translate",
-               "--config",
-               "GDAL_CACHEMAX",
-               str(gdal_cachemax),
-               "-projwin",
-               str(min_lon),
-               str(max_lat),
-               str(max_lon),
-               str(min_lat),
-               rpc_dem,
-               dem_chip],
-              fail_msg="Failed to subset DEM %s" % rpc_dem,
-              cwd=dem_dir)
-
-    # Get the DEM's pixel resolution
-    dem_pixel_size = None
-    try:
-        ds = gdal.Open(dem_chip)
-        dem_pixel_size = ds.GetGeoTransform()[1]
-    finally:
-        ds = None
-    if dem_pixel_size is None:
-        raise InputError("Failed to get DEM chip %s pixel size" % dem_chip)
-    logger.info("DEM pixel size is %.10f" % dem_pixel_size)
-
-    #  whether the DEM needs to be adjusted to height above ellipsoid
-    if apply_geoid:
-        # Subset geoid to match the DEM chip
-        geoid_chip = os.path.join(dem_dir, base_name + "_GEOID.tif")
-        logger.info("Subsetting geoid, (lat, lon) = (%.10f, %.10f) - (%.10f, %.10f)" % \
-                    (min_lat, min_lon, max_lat, max_lon))
-        __run_cmd(["gdalwarp",
-                   "--config",
-                   "GDAL_CACHEMAX",
-                   str(gdal_cachemax),
-                   "-wm",
-                   str(warp_memsize),
-                   "-t_srs",
-                   "EPSG:4326",
-                   "-te",
-                   str(min_lon),
-                   str(min_lat),
-                   str(max_lon),
-                   str(max_lat),
-                   "-tr",
-                   str(dem_pixel_size),
-                   str(dem_pixel_size),
-                   "-r",
-                   "bilinear",
-                   GEOID_PATH,
-                   geoid_chip],
-                  fail_msg="Failed to subset geoid %s" % GEOID_PATH,
-                  cwd=dem_dir)
-
-        # Add the geoid to the DEM chip
-        dem_plus_geoid_chip = os.path.join(dem_dir, base_name + "_DEM_PLUS_GEOID.tif")
-        logger.info("Adding geoid to DEM")
-        __run_cmd(["gdal_calc.py",
-                   "-A",
-                   dem_chip,
-                   "-B",
-                   geoid_chip,
-                   "--calc",
-                   "A+B",
-                   "--outfile",
-                   dem_plus_geoid_chip],
-                  fail_msg="Failed to add geoid %s to DEM %s" % (geoid_chip, dem_chip),
-                  cwd=dem_dir)
-        dem_chip = dem_plus_geoid_chip
-
-    return dem_chip
-
-def __run_cmd(args, fail_msg="Command failed", cwd=None, env=None):
-    # Get logger
-    logger = logging.getLogger(__name__)
-
-    # Convert args to strings
-    string_args = [str(a) for a in args]
-    logger.info("Running command: %s" % " ".join(['"%s"' % a for a in string_args]))
-
-    # Spawn child process and wait for it to complete
-    p_obj = subprocess.Popen(string_args,
-                             cwd=cwd,
-                             env=env)
-    retval = p_obj.wait()
-    if retval != 0:
-        raise CommandError("%s, returned non-zero exit status %d" % \
-                           (fail_msg, retval))
 
 class ThreadPoolExecutorWithCallback(ThreadPoolExecutor):
     """ThreadPoolExecutor which automatically adds a callback to each future.
