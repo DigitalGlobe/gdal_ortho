@@ -130,9 +130,9 @@ def aoi_to_srs(aoi, srs):
               type=str,
               default=None,
               help="Path to DEM for orthorectification. (If omitted, the worldwide DEM stored in s3://dgdem is used. "
-              "Contact the GBDX team for acces to the bucket.)")
-@click.option("--use-hae",
-              is_flag=True,
+              "Contact the GBDX team for access to the bucket.)")
+@click.option("-hae/-nohae",
+              "--use-hae/--no-use-hae",
               default=False,
               help="Use image average height above ellipsoid instead of a DEM for orthorectification. Default is "
               "to use DEM.")
