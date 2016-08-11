@@ -529,6 +529,7 @@ def worker_thread(part_num,
         logger.info("Processing part P%03d band %s" % (part_num, band))
         shp_filename = band_shps[band]
         imd_filename = band_info[band].imd_file
+        xml_filename = os.path.splitext(imd_filename)[0] + ".XML"
         band_pixel_size = band_pixel_sizes[band]
 
         # Read in the shapefile
@@ -632,10 +633,16 @@ def worker_thread(part_num,
                         (input_file, dem_chip),
                         cwd=temp_dir)
 
-                # Copy the input file's IMD to the output location
+                # Copy the input file's IMD to the output
+                # location. Also copy the corresponding XML file if it
+                # exists.
                 shutil.copy(imd_filename,
                             os.path.join(output_file_dir,
                                          os.path.basename(imd_filename)))
+                if os.path.isfile(xml_filename):
+                    shutil.copy(xml_filename,
+                                os.path.join(output_file_dir,
+                                             os.path.basename(xml_filename)))
 
         else: # rpc_dem is None
             # Orthorectify all TIFs in the input directory using
@@ -672,10 +679,16 @@ def worker_thread(part_num,
                         (input_file, avg_hae),
                         cwd=temp_dir)
 
-                # Copy the input file's IMD to the output location
+                # Copy the input file's IMD to the output
+                # location. Also copy the corresponding XML file if it
+                # exists.
                 shutil.copy(imd_filename,
                             os.path.join(output_file_dir,
                                          os.path.basename(imd_filename)))
+                if os.path.isfile(xml_filename):
+                    shutil.copy(xml_filename,
+                                os.path.join(output_file_dir,
+                                             os.path.basename(xml_filename)))
 
 def __parse_imd(imd_file):
     """Parses an IMD file for metadata.
