@@ -610,7 +610,7 @@ def worker_thread(part_num,
                 # the path below output_dir to use for the output
                 # file.
                 tif_rel_path = os.path.relpath(input_file, input_dir)
-                output_file = os.path.join(output_dir, tif_rel_path)
+                output_file = __update_filename(os.path.join(output_dir, tif_rel_path))
                 output_file_dir = os.path.dirname(output_file)
                 if not os.path.isdir(output_file_dir):
                     os.makedirs(output_file_dir)
@@ -639,12 +639,12 @@ def worker_thread(part_num,
                 # location. Also copy the corresponding XML file if it
                 # exists.
                 shutil.copy(imd_filename,
-                            os.path.join(output_file_dir,
-                                         os.path.basename(imd_filename)))
+                            __update_filename(os.path.join(output_file_dir,
+                                                           os.path.basename(imd_filename))))
                 if os.path.isfile(xml_filename):
                     shutil.copy(xml_filename,
-                                os.path.join(output_file_dir,
-                                             os.path.basename(xml_filename)))
+                                __update_filename(os.path.join(output_file_dir,
+                                                               os.path.basename(xml_filename))))
 
         else: # rpc_dem is None
             # Orthorectify all TIFs in the input directory using
@@ -657,7 +657,7 @@ def worker_thread(part_num,
                 # the path below output_dir to use for the output
                 # file.
                 tif_rel_path = os.path.relpath(input_file, input_dir)
-                output_file = os.path.join(output_dir, tif_rel_path)
+                output_file = __update_filename(os.path.join(output_dir, tif_rel_path))
                 output_file_dir = os.path.dirname(output_file)
                 if not os.path.isdir(output_file_dir):
                     os.makedirs(output_file_dir)
@@ -685,12 +685,12 @@ def worker_thread(part_num,
                 # location. Also copy the corresponding XML file if it
                 # exists.
                 shutil.copy(imd_filename,
-                            os.path.join(output_file_dir,
-                                         os.path.basename(imd_filename)))
+                            __update_filename(os.path.join(output_file_dir,
+                                                           os.path.basename(imd_filename))))
                 if os.path.isfile(xml_filename):
                     shutil.copy(xml_filename,
-                                os.path.join(output_file_dir,
-                                             os.path.basename(xml_filename)))
+                                __update_filename(os.path.join(output_file_dir,
+                                                               os.path.basename(xml_filename))))
 
 def __parse_imd(imd_file):
     """Parses an IMD file for metadata.
@@ -786,6 +786,21 @@ def __get_utm_epsg_code(lat, lon):
     else:
         base_epsg = 32700
     return base_epsg + int(zone_num)
+
+def __update_filename(filename):
+    """Updates the product level in a filename from 1B to 3X (custom ortho).
+
+    Args:
+        filename: Filename to update.
+
+    Returns the updated filename.
+
+    """
+
+    m_obj = re.search(r"(.+-\w)1B(\w-.+)", filename)
+    if m_obj is not None:
+        return m_obj.group(1) + "3X" + m_obj.group(2)
+    return filename
 
 class ThreadPoolExecutorWithCallback(ThreadPoolExecutor):
     """ThreadPoolExecutor which automatically adds a callback to each future.
