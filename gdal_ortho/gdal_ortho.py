@@ -215,6 +215,8 @@ def gdal_ortho(input_dir,
     output_dir = os.path.realpath(output_dir)
     if rpc_dem is not None:
         rpc_dem = os.path.realpath(rpc_dem)
+    if tmpdir is not None:
+        tmpdir = os.path.realpath(tmpdir)
 
     # Parse band list
     if bands is not None:
