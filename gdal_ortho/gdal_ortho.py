@@ -30,12 +30,19 @@ DEM_CHIP_MARGIN_DEG = 0.25
 UTM_ZONES_PATH = os.path.join(os.path.dirname(os.path.realpath(__file__)),
                               "data",
                               "UTM_Zone_Boundaries.geojson")
-BAND_ALIASES = {
+IMD_BAND_ALIASES = {
+    # IMD bandId: supported "bands" input value
     "P":     "PAN",
     "Multi": "MS",
     "MS1":   "MS",
     "MS2":   "MS",
     "All-S": "SWIR"
+}
+FILENAME_BAND_ALIASES = {
+    # Filename char: supported "bands" input value
+    "P": "PAN",
+    "M": "MS",
+    "A": "SWIR"
 }
 
 # Initialize logging (root level WARNING, app level INFO)
@@ -242,13 +249,17 @@ def gdal_ortho(input_dir,
                 if m_obj is not None:
                     band_char = m_obj.group(1)
                     part_num = int(m_obj.group(2))
-                    part_shps[part_num][band_char] = os.path.join(path, f)
+                    if band_char not in FILENAME_BAND_ALIASES:
+                        logger.warn("PIXEL_SHAPE filename %s contains unknown band character %s" % \
+                                    (f, band_char))
+                    else:
+                        band_alias = FILENAME_BAND_ALIASES[band_char]
+                        part_shps[part_num][band_alias] = os.path.join(path, f)
 
         # Look for part directories
-        m_obj = re.search(r".+_p(\d+)_(\w+)$", path, flags=re.IGNORECASE)
+        m_obj = re.search(r".+_p(\d+)_\w+$", path, flags=re.IGNORECASE)
         if m_obj is not None:
             part_num = int(m_obj.group(1))
-            band_char = m_obj.group(2)[0]
 
             # Look for IMD files
             imd_info = None
@@ -259,19 +270,19 @@ def gdal_ortho(input_dir,
                 logger.warn("Part directory %s has no IMD file" % path)
             else:
                 # Check band ID
-                if imd_info.band_id not in BAND_ALIASES:
+                if imd_info.band_id not in IMD_BAND_ALIASES:
                     logger.warn("IMD file %s contains unknown bandId %s" % \
                                 (imd_info.imd_file, imd_info.band_id))
                 else:
-                    band_alias = BAND_ALIASES[imd_info.band_id]
+                    band_alias = IMD_BAND_ALIASES[imd_info.band_id]
                     if bands_to_process is not None and \
                        band_alias not in bands_to_process:
                         logger.info("Skipping part directory %s (%s)" % \
                                     (path, band_alias))
                     else:
                         # Save this part directory
-                        part_dirs[part_num][band_char] = path
-                        part_info[part_num][band_char] = imd_info
+                        part_dirs[part_num][band_alias] = path
+                        part_info[part_num][band_alias] = imd_info
                         logger.info("Found part directory %s (%s)" % \
                                     (path, band_alias))
     logger.info("Found %d part directories" % len(part_dirs))
@@ -439,10 +450,15 @@ def gdal_ortho(input_dir,
                     m_obj = re.search(r"\w+-(\w)\w+-\w+_p\d+.tif$", f, flags=re.IGNORECASE)
                     if m_obj is not None:
                         band_char = m_obj.group(1)
-                        tifs_by_band[band_char].append(os.path.join(path, f))
+                        if band_char not in FILENAME_BAND_ALIASES:
+                            logger.warn("Output TIF filename %s contains unknown band character %s" % \
+                                        (f, band_char))
+                        else:
+                            band_alias = FILENAME_BAND_ALIASES[band_char]
+                            tifs_by_band[band_alias].append(os.path.join(path, f))
 
             # Create a VRT for each band
-            for (band_char, tif_list) in tifs_by_band.iteritems():
+            for (band_alias, tif_list) in tifs_by_band.iteritems():
                 # Use the first TIF's name
                 m_obj = re.search(r"(.+)_p\d+.tif$",
                                   os.path.basename(tif_list[0]),
@@ -450,18 +466,18 @@ def gdal_ortho(input_dir,
                 if m_obj is not None:
                     vrt_name = m_obj.group(1) + ".vrt"
                 else:
-                    vrt_name = "ortho_%s.vrt" % band_char
+                    vrt_name = "ortho_%s.vrt" % band_alias
 
                 # Get relative paths to files from the output directory
                 relpaths = [os.path.relpath(f, output_dir) for f in tif_list]
 
                 # Create VRT (paths are relative to output_dir)
-                logger.info("Creating band %s VRT %s" % (band_char, vrt_name))
+                logger.info("Creating band %s VRT %s" % (band_alias, vrt_name))
                 run_cmd(["gdalbuildvrt",
                          "-srcnodata",
                          "0",
                          vrt_name] + relpaths,
-                        fail_msg="Failed to create band %s VRT %s" % (band_char, vrt_name),
+                        fail_msg="Failed to create band %s VRT %s" % (band_alias, vrt_name),
                         cwd=output_dir)
 
     finally:
