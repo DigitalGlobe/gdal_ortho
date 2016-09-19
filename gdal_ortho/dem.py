@@ -218,7 +218,10 @@ def fetch_dgdem_tiles(aoi_geom, output_vrt, margin=DEFAULT_DEM_MARGIN_DEG):
 
     # Generate VRT containing DEM tiles
     logger.info("Creating VRT " + output_vrt)
-    run_cmd(["gdalbuildvrt", output_vrt] + dem_files,
+    run_cmd(["gdalbuildvrt",
+             "-vrtnodata",
+             "None",
+             output_vrt] + dem_files,
             fail_msg="Failed to create DEM VRT")
     return True
 
