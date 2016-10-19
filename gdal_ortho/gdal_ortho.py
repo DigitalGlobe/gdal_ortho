@@ -654,13 +654,15 @@ def worker_thread(part_num,
                 # Copy the input file's IMD to the output
                 # location. Also copy the corresponding XML file if it
                 # exists.
-                shutil.copy(imd_filename,
-                            __update_filename(os.path.join(output_file_dir,
-                                                           os.path.basename(imd_filename))))
+                updated_imd_filename = __update_filename(os.path.join(output_file_dir,
+                                                                      os.path.basename(imd_filename)))
+                shutil.copy(imd_filename, updated_imd_filename)
+                __update_product_level(updated_imd_filename)
                 if os.path.isfile(xml_filename):
-                    shutil.copy(xml_filename,
-                                __update_filename(os.path.join(output_file_dir,
-                                                               os.path.basename(xml_filename))))
+                    updated_xml_filename = __update_filename(os.path.join(output_file_dir,
+                                                                          os.path.basename(xml_filename)))
+                    shutil.copy(xml_filename, updated_xml_filename)
+                    __update_product_level(updated_xml_filename)
 
         else: # rpc_dem is None
             # Orthorectify all TIFs in the input directory using
@@ -817,6 +819,33 @@ def __update_filename(filename):
     if m_obj is not None:
         return m_obj.group(1) + "3X" + m_obj.group(2)
     return filename
+
+def __update_product_level(filename):
+    """Updates the product level in metadata files from 1B to 3X (custom ortho).
+
+    Args:
+        filename: Filename of file to update in place.
+
+    """
+
+    ext = os.path.splitext(filename)[1].lower()
+    if ext == ".imd":
+        with open(filename, "r+") as f_obj:
+            file_str = f_obj.read()
+            file_str = re.sub(r'(productLevel\s*=\s*")LV1B(";)',
+                              r"\1LV3X\2",
+                              file_str)
+            f_obj.seek(0)
+            f_obj.write(file_str)
+
+    elif ext == ".xml":
+        with open(filename, "r+") as f_obj:
+            file_str = f_obj.read()
+            file_str = re.sub(r"(<PRODUCTLEVEL>)LV1B(</PRODUCTLEVEL>)",
+                              r"\1LV3X\2",
+                              file_str)
+            f_obj.seek(0)
+            f_obj.write(file_str)
 
 class ThreadPoolExecutorWithCallback(ThreadPoolExecutor):
     """ThreadPoolExecutor which automatically adds a callback to each future.
