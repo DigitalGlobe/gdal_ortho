@@ -1,6 +1,8 @@
 import logging
 import os
+import re
 import sys
+from urlparse import urlparse
 
 import boto3
 import click
@@ -22,17 +24,55 @@ GEOID_PATH = os.path.join(os.path.dirname(os.path.realpath(__file__)),
                           "data",
                           "geoid_egm96-5_shifted.tif")
 DEFAULT_DEM_MARGIN_DEG = 0.1
-DGDEM_BUCKET = "dgdem"
-DGDEM_CURRENT_KEY = "current.txt"
-DGDEM_TILE_FORMAT = "DEM_%s.TIF"
-DGDEM_GROUP_LEVEL = 3
-DGDEM_TILE_LEVEL = 7
 
 # Initialize logging (root level WARNING, app level INFO)
 logging_format = "[%(asctime)s|%(levelname)s|%(name)s|%(lineno)d] %(message)s"
 logging.basicConfig(stream=sys.stdout, level=logging.WARNING, format=logging_format)
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+def parse_s3_url(url):
+    """Parses an S3 URL to extract the bucket and key.
+
+    This function handles a few different S3 URL formats:
+        http://s3.amazonaws.com/bucket/key
+        http://bucket.s3.amazonaws.com/key
+        s3://bucket/key
+
+    Args:
+        url: The S3 URL to parse.
+
+    Returns a tuple containing (bucket, key). If the provided URL is
+    not a valid S3 URL, an empty bucket and key are returned,
+    i.e. ("", "").
+
+    """
+
+    # Parse URL
+    parsed_url = urlparse(url)
+    netloc = parsed_url.netloc
+    path = parsed_url.path
+    if path.startswith("/"):
+        path = path[1:]
+
+    # Initialize empty bucket/key and check the hostname
+    bucket = ""
+    key = ""
+    if netloc == "s3.amazonaws.com":
+        # Bucket is the first part of the path
+        split_path = path.split("/")
+        if len(split_path) >= 2:
+            bucket = split_path[0]
+            key = "/".join(split_path[1:])
+    elif netloc:
+        # Hostname is not empty, so bucket is in the netloc as a
+        # "virtual host"
+        m_obj = re.search(r"([^\.]+)", netloc)
+        if m_obj is not None:
+            bucket = m_obj.group(1)
+            key = path
+
+    return (bucket, key)
 
 def local_dem_chip(base_name,
                    dem_dir,
@@ -97,7 +137,7 @@ def local_dem_chip(base_name,
         raise InputError("Failed to get DEM chip %s pixel size" % dem_chip)
     logger.info("DEM pixel size is %.10f" % dem_pixel_size)
 
-    #  whether the DEM needs to be adjusted to height above ellipsoid
+    # Check whether the DEM needs to be adjusted to height above ellipsoid
     if apply_geoid:
         # Subset geoid to match the DEM chip
         geoid_chip = os.path.join(dem_dir, base_name + "_GEOID.tif")
@@ -144,21 +184,23 @@ def local_dem_chip(base_name,
 
     return dem_chip
 
-def fetch_dgdem_tiles(aoi_geom, output_vrt, margin=DEFAULT_DEM_MARGIN_DEG):
-    """Fetches DEM tiles from the GBDX s3://dgdem bucket.
+def download_tiles(dem_url, aoi_geom, output_vrt, margin=DEFAULT_DEM_MARGIN_DEG):
+    """Fetches DEM tiles from S3.
 
-    The DEM is stored in level 7 tiles. This function fetches the
-    tiles required to cover an AOI and generates a VRT to bundle all
-    the tiles together.
+    If the specified URL is a single object, it is assumed to be a
+    text file containing the prefix of the DEM in the current
+    bucket. This can be used like a symbolic link to point at the most
+    recent version in the bucket. For example, the GBDX account
+    contains a factory DEM at s3://dgdem/current.txt. Inside of
+    current.txt is the actual prefix, "DEM_2016_08_12". So tiles are
+    stored under s3://dgdem/DEM_2016_08_12.
 
-    The entire DEM is stored under a prefix with a date code. Below
-    that, tiles are grouped into prefixes for each level 3
-    block. Below that, each level 7 tile is named DEM_<quadkey>.tif.
-
-    The prefix to use for the latest DEM version is stored in a text
-    file at s3://dgdem/current.txt.
+    If the specified URL is not a single object (i.e. it is a prefix),
+    DEM tiles are assumed to be stored within it. The tiles are
+    assumed to be in the EPSG:4326 DG tiling scheme.
 
     Args:
+        dem_url: S3 URL of DEM tiles.
         aoi_geom: Shapely geometry defining the AOI to cover.
         output_vrt: Filename of output VRT containing the DEM tiles
             that cover the AOI.
@@ -168,52 +210,72 @@ def fetch_dgdem_tiles(aoi_geom, output_vrt, margin=DEFAULT_DEM_MARGIN_DEG):
 
     """
 
+    # Check whether the DEM URL is a prefix
+    s3 = boto3.resource("s3")
+    (bucket_name, key) = parse_s3_url(dem_url)
+    obj = s3.Object(bucket_name, key)
+    try:
+        obj.content_length
+        is_prefix = False
+        logger.info("%s is a pointer, downloading contents" % dem_url)
+    except ClientError as exc:
+        if "404" in str(exc):
+            is_prefix = True
+            logger.info("%s is a prefix" % dem_url)
+        else:
+            logger.error(str(exc))
+            return False
+    bucket = s3.Bucket(bucket_name)
+
+    # If the URL is not a prefix, open it to find the actual prefix
+    if not is_prefix:
+        # Download file with prefix in it
+        pointer = bucket.Object(key)
+        prefix = pointer.get()["Body"].read().strip()
+    else:
+        # URL is already a prefix
+        prefix = key
+
+    # Get the tile keys
+    logger.info("Searching for tiles under s3://%s/%s" % (bucket_name, prefix))
+    dem_tiles = {}
+    for obj in bucket.objects.filter(Prefix=prefix):
+        mobj = re.search("([0-3]+)[^/]+$", obj.key)
+        if mobj is not None:
+            dem_tiles[mobj.group(1)] = obj.key
+    if not dem_tiles:
+        logger.error("No DEM tiles found in bucket %s under prefix %s" % \
+                     (bucket_name, prefix))
+        return False
+
+    # Grab a key and determine the zoom level
+    zoom_level = len(dem_tiles.keys()[0])
+    logger.info("Found %d tiles, assuming zoom level %d" % (len(dem_tiles), zoom_level))
+
     # Get the quadkeys that cover the AOI
     scheme = tiletanic.tileschemes.DGTiling()
-    tile_gen = tiletanic.tilecover.cover_geometry(scheme, aoi_geom, DGDEM_TILE_LEVEL)
+    tile_gen = tiletanic.tilecover.cover_geometry(scheme, aoi_geom, zoom_level)
     qks = [scheme.quadkey(tile) for tile in tile_gen]
+    missing_qks = [qk for qk in qks if qk not in dem_tiles]
+    if missing_qks:
+        logger.error("%d quadkeys missing from DEM: %s" % \
+                     (len(missing_qks), ", ".join(missing_qks)))
+        return False
     logger.info("Found %d quadkeys that cover the AOI: %s" % \
                 (len(qks), ", ".join(qks)))
-
-    # Download the pointer file that says what DEM prefix to use
-    s3 = boto3.resource("s3")
-    bucket = s3.Bucket(DGDEM_BUCKET)
-    pointer = bucket.Object(DGDEM_CURRENT_KEY)
-    prefix = pointer.get()["Body"].read().strip()
-
-    # Generate S3 keys to download
-    def key_from_quadkey(qk):
-        group = qk[0:DGDEM_GROUP_LEVEL]
-        return os.path.join(prefix, group, DGDEM_TILE_FORMAT % qk)
-    key_map = {qk:key_from_quadkey(qk) for qk in qks}
-
-    # Verify that all keys are available
-    tiles_missing = False
-    for (qk, key) in key_map.iteritems():
-        try:
-            obj = bucket.Object(key)
-            obj.load()
-        except ClientError as exc:
-            if "404" not in exc.message:
-                raise exc
-            else:
-                logger.warn("Missing S3 object s3://%s/%s for quadkey %s" % \
-                            (DGDEM_BUCKET, key, qk))
-                tiles_missing = True
-    if tiles_missing:
-        return False
 
     # Download DEM tiles from S3
     out_dir = os.path.dirname(output_vrt)
     dem_files = []
-    for (qk, key) in key_map.iteritems():
+    for qk in qks:
+        key = dem_tiles[qk]
         dem_filename = os.path.join(out_dir, key)
         dem_filename_dir = os.path.dirname(dem_filename)
         if not os.path.isdir(dem_filename_dir):
             os.makedirs(dem_filename_dir)
         dem_files.append(dem_filename)
         logger.info("Downloading quadkey %s tile s3://%s/%s to %s" % \
-                    (qk, DGDEM_BUCKET, key, dem_filename))
+                    (qk, bucket_name, key, dem_filename))
         bucket.download_file(key, dem_filename)
 
     # Generate VRT containing DEM tiles
@@ -226,6 +288,11 @@ def fetch_dgdem_tiles(aoi_geom, output_vrt, margin=DEFAULT_DEM_MARGIN_DEG):
     return True
 
 @click.command()
+@click.option("-url",
+              "--dem-url",
+              type=str,
+              default="s3://dgdem/current.txt",
+              help="S3 URL of DEM. (Default s3://dgdem/current.txt)")
 @click.option("-aoi",
               "--aoi",
               required=True,
@@ -242,19 +309,20 @@ def fetch_dgdem_tiles(aoi_geom, output_vrt, margin=DEFAULT_DEM_MARGIN_DEG):
               default=DEFAULT_DEM_MARGIN_DEG,
               help="Margin in degrees to buffer around AOI. (Default %s deg)" % \
               DEFAULT_DEM_MARGIN_DEG)
-def fetch_dgdem(aoi, output_vrt, margin):
-    """Fetches DEM tiles from the GBDX s3://dgdem bucket.
+def fetch_dem(dem_url, aoi, output_vrt, margin):
+    """Fetches DEM tiles from S3.
 
-    The DEM is stored in level 7 tiles. This function fetches the
-    tiles required to cover an AOI and generates a VRT to bundle all
-    the tiles together.
+    If the specified URL is a single object, it is assumed to be a
+    text file containing the prefix of the DEM in the current
+    bucket. This can be used like a symbolic link to point at the most
+    recent version in the bucket. For example, the GBDX account
+    contains a factory DEM at s3://dgdem/current.txt. Inside of
+    current.txt is the actual prefix, "DEM_2016_08_12". So tiles are
+    stored under s3://dgdem/DEM_2016_08_12.
 
-    The entire DEM is stored under a prefix with a date code. Below
-    that, tiles are grouped into prefixes for each level 3
-    block. Below that, each level 7 tile is named DEM_<quadkey>.tif.
-
-    The prefix to use for the latest DEM version is stored in a text
-    file at s3://dgdem/current.txt.
+    If the specified URL is not a single object (i.e. it is a prefix),
+    DEM tiles are assumed to be stored within it. The tiles are
+    assumed to be in the EPSG:4326 DG tiling scheme.
 
     """
 
@@ -265,5 +333,5 @@ def fetch_dgdem(aoi, output_vrt, margin):
     aoi_geom = shapely.ops.unary_union(geoms).buffer(margin)
 
     # Download the tiles
-    fetch_dgdem_tiles(aoi_geom, os.path.realpath(output_vrt), margin)
+    download_tiles(dem_url, aoi_geom, os.path.realpath(output_vrt), margin)
 

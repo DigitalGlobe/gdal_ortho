@@ -135,9 +135,9 @@ def aoi_to_srs(aoi, srs):
 @click.option("-dem",
               "--rpc-dem",
               type=str,
-              default=None,
-              help="Path to DEM for orthorectification. (If omitted, the worldwide DEM stored in s3://dgdem is used. "
-              "Contact the GBDX team for access to the bucket.)")
+              default="s3://dgdem/current.txt",
+              help="Local path or S3 URL of DEM for orthorectification. (If omitted, the worldwide DEM stored in "
+              "s3://dgdem is used. Contact the GBDX team for access to the bucket.)")
 @click.option("-hae/-nohae",
               "--use-hae/--no-use-hae",
               default=False,
@@ -220,7 +220,7 @@ def gdal_ortho(input_dir,
     # Fix paths
     input_dir = os.path.realpath(input_dir)
     output_dir = os.path.realpath(output_dir)
-    if rpc_dem is not None:
+    if os.path.exists(rpc_dem):
         rpc_dem = os.path.realpath(rpc_dem)
     if tmpdir is not None:
         tmpdir = os.path.realpath(tmpdir)
@@ -230,10 +230,6 @@ def gdal_ortho(input_dir,
         bands_to_process = set(re.split(r"\s+|\s*,\s*", bands))
     else:
         bands_to_process = None
-
-    # Override DEM input if using height above ellipsoid
-    if use_hae:
-        rpc_dem = None
 
     # Walk the input directory to find all the necessary files. Store
     # by part number then by band.
@@ -384,11 +380,13 @@ def gdal_ortho(input_dir,
     temp_dir = tempfile.mkdtemp(dir=tmpdir)
     try:
         # Check whether to download DEM data from S3
-        if not use_hae and rpc_dem is None:
-            # The use_hae flag is not set and no DEM path was
-            # specified on the command line. Try to copy from S3.
-            dem_vrt = os.path.join(temp_dir, "dgdem_" + str(uuid.uuid4()) + ".vrt")
-            if dem.fetch_dgdem_tiles(full_geom.buffer(DEM_FETCH_MARGIN_DEG), dem_vrt):
+        if not use_hae and not os.path.exists(rpc_dem):
+            # The use_hae flag is not set and the DEM path doesn't
+            # exist locally. Assume it is an S3 path.
+            dem_vrt = os.path.join(temp_dir, "s3dem_" + str(uuid.uuid4()) + ".vrt")
+            if dem.download_tiles(rpc_dem,
+                                  full_geom.buffer(DEM_FETCH_MARGIN_DEG),
+                                  dem_vrt):
                 logger.info("Downloaded DEM tiles, using VRT %s" % dem_vrt)
                 rpc_dem = dem_vrt
             else:
@@ -604,7 +602,7 @@ def worker_thread(part_num,
                     if f.lower().endswith(".tif")]
 
         # Check whether DEM is available
-        if rpc_dem is not None:
+        if os.path.exists(rpc_dem):
             # Get the DEM chip if it hasn't already been created
             if dem_chip is None:
                 dem_chip = dem.local_dem_chip(os.path.basename(band_input_dir),
@@ -664,7 +662,7 @@ def worker_thread(part_num,
                     shutil.copy(xml_filename, updated_xml_filename)
                     __update_product_level(updated_xml_filename)
 
-        else: # rpc_dem is None
+        else: # rpc_dem does not exist
             # Orthorectify all TIFs in the input directory using
             # average height above ellipsoid
             for input_file in tif_list:

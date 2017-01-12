@@ -16,6 +16,6 @@ setup(name="gdal_ortho",
           [console_scripts]
           gdal_ortho=gdal_ortho.gdal_ortho:gdal_ortho
           aoi_to_srs=gdal_ortho.gdal_ortho:aoi_to_srs
-          fetch_dgdem=gdal_ortho.dem:fetch_dgdem
+          fetch_dem=gdal_ortho.dem:fetch_dem
       ''')
 
