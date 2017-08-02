@@ -12,11 +12,11 @@ from collections import defaultdict, namedtuple
 from concurrent.futures import ThreadPoolExecutor
 
 import click
+import shapely.geometry
+import shapely.ops
 import fiona
 import fiona.crs
 import fiona.transform
-import shapely.geometry
-import shapely.ops
 from osgeo import osr
 
 import dem
