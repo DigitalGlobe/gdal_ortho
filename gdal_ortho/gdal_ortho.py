@@ -19,6 +19,7 @@ import fiona.crs
 import fiona.transform
 from osgeo import osr
 
+import aws
 import dem
 from run_cmd import run_cmd
 
@@ -107,8 +108,8 @@ def aoi_to_srs(aoi, srs):
                 (bounds[0], bounds[1], bounds[2], bounds[3]))
 
 @click.command()
-@click.argument("input_dir", type=click.Path(exists=True))
-@click.argument("output_dir", type=click.Path())
+@click.argument("input_dir", type=str)
+@click.argument("output_dir", type=str)
 @click.option("-srs",
               "--target-srs",
               type=str,
@@ -217,168 +218,171 @@ def gdal_ortho(input_dir,
 
     """
 
-    # Fix paths
-    input_dir = os.path.realpath(input_dir)
-    output_dir = os.path.realpath(output_dir)
-    if os.path.exists(rpc_dem):
-        rpc_dem = os.path.realpath(rpc_dem)
+    # Create a working directory for temporary data
     if tmpdir is not None:
         tmpdir = os.path.realpath(tmpdir)
-
-    # Parse band list
-    if bands is not None:
-        bands_to_process = set(re.split(r"\s+|\s*,\s*", bands))
-    else:
-        bands_to_process = None
-
-    # Walk the input directory to find all the necessary files. Store
-    # by part number then by band.
-    part_shps = defaultdict(dict)
-    part_dirs = defaultdict(dict)
-    part_info = defaultdict(dict)
-    for (path, dirs, files) in os.walk(input_dir, followlinks=True):
-        # Look for GIS_FILES directory
-        if os.path.basename(path).lower() == "gis_files":
-            for f in files:
-                # Find the per-part PIXEL_SHAPE files
-                m_obj = re.search(r"\w+-(\w)\w+-\w+_p(\d+)_pixel_shape.shp$", f, flags=re.IGNORECASE)
-                if m_obj is not None:
-                    band_char = m_obj.group(1)
-                    part_num = int(m_obj.group(2))
-                    if band_char not in FILENAME_BAND_ALIASES:
-                        logger.warn("PIXEL_SHAPE filename %s contains unknown band character %s" % \
-                                    (f, band_char))
-                    else:
-                        band_alias = FILENAME_BAND_ALIASES[band_char]
-                        part_shps[part_num][band_alias] = os.path.join(path, f)
-
-        # Look for part directories
-        m_obj = re.search(r".+_p(\d+)_\w+$", path, flags=re.IGNORECASE)
-        if m_obj is not None:
-            part_num = int(m_obj.group(1))
-
-            # Look for IMD files
-            imd_info = None
-            for f in files:
-                if os.path.splitext(f)[1].lower() == ".imd":
-                    imd_info = __parse_imd(os.path.join(path, f))
-            if imd_info is None:
-                logger.warn("Part directory %s has no IMD file" % path)
-            else:
-                # Check band ID
-                if imd_info.band_id not in IMD_BAND_ALIASES:
-                    logger.warn("IMD file %s contains unknown bandId %s" % \
-                                (imd_info.imd_file, imd_info.band_id))
-                else:
-                    band_alias = IMD_BAND_ALIASES[imd_info.band_id]
-                    if bands_to_process is not None and \
-                       band_alias not in bands_to_process:
-                        logger.info("Skipping part directory %s (%s)" % \
-                                    (path, band_alias))
-                    else:
-                        # Save this part directory
-                        part_dirs[part_num][band_alias] = path
-                        part_info[part_num][band_alias] = imd_info
-                        logger.info("Found part directory %s (%s)" % \
-                                    (path, band_alias))
-    logger.info("Found %d part directories" % len(part_dirs))
-
-    # Load all the shapefiles into one big geometry
-    geoms = []
-    for band_shps in part_shps.itervalues():
-        for shp_filename in band_shps.itervalues():
-            with fiona.open(shp_filename, "r") as shp:
-                geoms += [shapely.geometry.shape(rec["geometry"]) for rec in shp]
-    full_geom = shapely.ops.unary_union(geoms)
-
-    # Handle special "UTM" target SRS
-    utm_epsg_code = None
-    if target_srs.lower() == "utm":
-        utm_epsg_code = __get_utm_epsg_code(full_geom.centroid.y,
-                                            full_geom.centroid.x)
-        target_srs = "EPSG:%d" % utm_epsg_code
-        logger.info("UTM target SRS is %s" % target_srs)
-
-    # Create a PROJ.4 string of the target SRS for easy fiona calls
-    try:
-        srs = osr.SpatialReference()
-        srs.SetFromUserInput(str(target_srs))
-        target_srs_proj4 = srs.ExportToProj4()
-    finally:
-        srs = None
-
-    # Transform the full geometry into the target SRS. Its bounding
-    # box defines the origin of the grid that each TIF should be
-    # orthorectified into.
-    src_crs = fiona.crs.from_epsg(4326)
-    dst_crs = fiona.crs.from_string(target_srs_proj4)
-    full_geom_srs = shapely.geometry.mapping(full_geom)
-    full_geom_srs = fiona.transform.transform_geom(src_crs,
-                                                   dst_crs,
-                                                   full_geom_srs)
-    full_geom_srs = shapely.geometry.shape(full_geom_srs)
-    grid_origin = full_geom_srs.bounds[0:2]
-    logger.info("Ortho grid origin: %.10f, %.10f" % \
-                (grid_origin[0], grid_origin[1]))
-
-    # Check whether pixel_size needs to be calculated
-    if pixel_size is None:
-        # Loop over all the image info and find the best (smallest)
-        # GSD. This will be used to define the pixel size in the
-        # target SRS.
-        min_gsd = min([info.avg_gsd
-                       for band_info in part_info.itervalues()
-                       for info in band_info.itervalues()])
-        logger.info("Best input GSD is %.10f" % min_gsd)
-
-        # Get the UTM zone to use
-        if utm_epsg_code is None:
-            utm_epsg_code = __get_utm_epsg_code(full_geom.centroid.y,
-                                                full_geom.centroid.x)
-
-        # Transform the full geometry's centroid into UTM
-        src_crs = fiona.crs.from_epsg(4326)
-        dst_crs = fiona.crs.from_epsg(utm_epsg_code)
-        pt = shapely.geometry.mapping(full_geom.centroid)
-        pt = fiona.transform.transform_geom(src_crs, dst_crs, pt)
-        pt = shapely.geometry.shape(pt)
-
-        # Add the best GSD to define a square in UTM space
-        pix = shapely.geometry.box(pt.x, pt.y, pt.x + min_gsd, pt.y + min_gsd)
-
-        # Transform the pixel box into the target SRS
-        src_crs = dst_crs
-        dst_crs = fiona.crs.from_string(target_srs_proj4)
-        pix = shapely.geometry.mapping(pix)
-        pix = fiona.transform.transform_geom(src_crs, dst_crs, pix)
-        pix = shapely.geometry.shape(pix)
-
-        # Use the smaller dimension from the bounding box of the
-        # transformed pixel as the pixel size. The larger dimension
-        # will just end up being slightly oversampled, so no data is
-        # lost.
-        bounds = pix.bounds
-        pixel_size = min(abs(bounds[2] - bounds[0]),
-                         abs(bounds[3] - bounds[1]))
-        logger.info("Calculated pixel size in target SRS is %.10f" % pixel_size)
-
-    # Find average height above ellipsoid over all parts
-    hae_vals = [info.avg_hae
-                for band_info in part_info.itervalues()
-                for info in band_info.itervalues()]
-    if hae_vals:
-        avg_hae = sum(hae_vals) / len(hae_vals)
-    else:
-        avg_hae = 0.0
-    logger.info("Average height above ellipsoid is %.10f" % avg_hae)
-
-    # Create a pool of worker threads. Each worker thread will call
-    # out to GDAL utilities to do actual work.
-    worker_pool = ThreadPoolExecutorWithCallback(max_workers=num_parallel)
-
-    # Create a working directory for temporary data
     temp_dir = tempfile.mkdtemp(dir=tmpdir)
     try:
+        # Handle S3 input
+        if aws.is_s3_url(input_dir):
+            s3_input_prefix = input_dir
+            if not s3_input_prefix.endswith("/"):
+                s3_input_prefix += "/"
+            input_dir = tempfile.mkdtemp(dir=temp_dir)
+            run_cmd(["aws", "s3", "sync", s3_input_prefix, input_dir],
+                    fail_msg="Failed to download input %s to %s" % \
+                    (s3_input_prefix, input_dir),
+                    cwd=input_dir)
+
+        # Handle S3 output
+        s3_output_prefix = None
+        if aws.is_s3_url(output_dir):
+            s3_output_prefix = output_dir
+            if not s3_output_prefix.endswith("/"):
+                s3_output_prefix += "/"
+            output_dir = tempfile.mkdtemp(dir=temp_dir)
+
+        # Fix paths
+        input_dir = os.path.realpath(input_dir)
+        output_dir = os.path.realpath(output_dir)
+        if os.path.exists(rpc_dem):
+            rpc_dem = os.path.realpath(rpc_dem)
+
+        # Parse band list
+        if bands is not None:
+            bands_to_process = set(re.split(r"\s+|\s*,\s*", bands))
+        else:
+            bands_to_process = None
+
+        # Walk the input directory to find IMD files and shapefiles
+        imd_paths = {}
+        shp_paths = {}
+        for (path, dirs, files) in os.walk(input_dir, followlinks=True):
+            # Look for GIS_FILES directory
+            if os.path.basename(path).lower() == "gis_files":
+                for f in files:
+                    # Find PIXEL_SHAPE shapefiles
+                    m_obj = re.search(r"^(.+)_pixel_shape.shp$", f, flags=re.IGNORECASE)
+                    if m_obj is not None:
+                        shp_paths[m_obj.group(1)] = os.path.join(path, f)
+            else:
+                # Look for IMDs
+                for f in files:
+                    if f.lower().endswith(".imd"):
+                        imd_paths[os.path.splitext(f)[0]] = os.path.join(path, f)
+
+        # Parse IMDs to determine the bands in each file
+        imd_infos = defaultdict(list)
+        for (base_name, imd_file) in imd_paths.iteritems():
+            imd_info = __parse_imd(imd_file)
+            if imd_info.band_id not in IMD_BAND_ALIASES:
+                logger.warn("IMD file %s contains unknown bandId %s" % \
+                            (imd_info.imd_file, imd_info.band_id))
+            else:
+                band_alias = IMD_BAND_ALIASES[imd_info.band_id]
+                if bands_to_process is not None and \
+                   band_alias not in bands_to_process:
+                    logger.info("Skipping %s (%s)" % (base_name, band_alias))
+                else:
+                    # This IMD belongs to an image to be processed.
+                    # Group by basename without respect to the bands
+                    # in the filename (i.e. group corresponding P1BS
+                    # and M1BS together).
+                    imd_infos[__get_general_basename(base_name)].append(imd_info)
+        logger.info("Found %d images to orthorectify" % len(imd_infos))
+
+        # Load all the shapefiles into one big geometry
+        geoms = []
+        for shp_filename in shp_paths.itervalues():
+            with fiona.open(shp_filename, "r") as shp:
+                geoms += [shapely.geometry.shape(rec["geometry"]) for rec in shp]
+        full_geom = shapely.ops.unary_union(geoms)
+
+        # Handle special "UTM" target SRS
+        utm_epsg_code = None
+        if target_srs.lower() == "utm":
+            utm_epsg_code = __get_utm_epsg_code(full_geom.centroid.y,
+                                                full_geom.centroid.x)
+            target_srs = "EPSG:%d" % utm_epsg_code
+            logger.info("UTM target SRS is %s" % target_srs)
+
+        # Create a PROJ.4 string of the target SRS for easy fiona calls
+        try:
+            srs = osr.SpatialReference()
+            srs.SetFromUserInput(str(target_srs))
+            target_srs_proj4 = srs.ExportToProj4()
+        finally:
+            srs = None
+
+        # Transform the full geometry into the target SRS. Its
+        # bounding box defines the origin of the grid that each TIF
+        # should be orthorectified into.
+        src_crs = fiona.crs.from_epsg(4326)
+        dst_crs = fiona.crs.from_string(target_srs_proj4)
+        full_geom_srs = shapely.geometry.mapping(full_geom)
+        full_geom_srs = fiona.transform.transform_geom(src_crs,
+                                                       dst_crs,
+                                                       full_geom_srs)
+        full_geom_srs = shapely.geometry.shape(full_geom_srs)
+        grid_origin = full_geom_srs.bounds[0:2]
+        logger.info("Ortho grid origin: %.10f, %.10f" % \
+                    (grid_origin[0], grid_origin[1]))
+
+        # Check whether pixel_size needs to be calculated
+        if pixel_size is None:
+            # Loop over all the image info and find the best
+            # (smallest) GSD. This will be used to define the pixel
+            # size in the target SRS.
+            min_gsd = min([imd_info.avg_gsd
+                           for imd_info_list in imd_infos.itervalues()
+                           for imd_info in imd_info_list])
+            logger.info("Best input GSD is %.10f" % min_gsd)
+
+            # Get the UTM zone to use
+            if utm_epsg_code is None:
+                utm_epsg_code = __get_utm_epsg_code(full_geom.centroid.y,
+                                                    full_geom.centroid.x)
+
+            # Transform the full geometry's centroid into UTM
+            src_crs = fiona.crs.from_epsg(4326)
+            dst_crs = fiona.crs.from_epsg(utm_epsg_code)
+            pt = shapely.geometry.mapping(full_geom.centroid)
+            pt = fiona.transform.transform_geom(src_crs, dst_crs, pt)
+            pt = shapely.geometry.shape(pt)
+
+            # Add the best GSD to define a square in UTM space
+            pix = shapely.geometry.box(pt.x, pt.y, pt.x + min_gsd, pt.y + min_gsd)
+
+            # Transform the pixel box into the target SRS
+            src_crs = dst_crs
+            dst_crs = fiona.crs.from_string(target_srs_proj4)
+            pix = shapely.geometry.mapping(pix)
+            pix = fiona.transform.transform_geom(src_crs, dst_crs, pix)
+            pix = shapely.geometry.shape(pix)
+
+            # Use the smaller dimension from the bounding box of the
+            # transformed pixel as the pixel size. The larger
+            # dimension will just end up being slightly oversampled,
+            # so no data is lost.
+            bounds = pix.bounds
+            pixel_size = min(abs(bounds[2] - bounds[0]),
+                             abs(bounds[3] - bounds[1]))
+            logger.info("Calculated pixel size in target SRS is %.10f" % pixel_size)
+
+        # Find average height above ellipsoid over all parts
+        hae_vals = [imd_info.avg_hae
+                    for imd_info_list in imd_infos.itervalues()
+                    for imd_info in imd_info_list]
+        if hae_vals:
+            avg_hae = sum(hae_vals) / len(hae_vals)
+        else:
+            avg_hae = 0.0
+        logger.info("Average height above ellipsoid is %.10f" % avg_hae)
+
+        # Create a pool of worker threads. Each worker thread will
+        # call out to GDAL utilities to do actual work.
+        worker_pool = ThreadPoolExecutorWithCallback(max_workers=num_parallel)
+
         # Check whether to download DEM data from S3
         if not use_hae and not os.path.exists(rpc_dem):
             # The use_hae flag is not set and the DEM path doesn't
@@ -394,17 +398,22 @@ def gdal_ortho(input_dir,
                             "average height above ellipsoid")
                 use_hae = True
 
-        # Loop over parts and submit jobs to worker pool
-        for part_num in part_dirs.iterkeys():
-            # Extract bands for this part
-            band_shps = part_shps[part_num]
-            band_dirs = part_dirs[part_num]
-            band_info = part_info[part_num]
+        # Loop over images and submit jobs to worker pool
+        for (gen_base_name, imd_info_list) in imd_infos.iteritems():
+            # Get inputs by band
+            band_info = {}
+            band_shps = {}
+            for imd_info in imd_info_list:
+                imd_base_name = os.path.splitext(os.path.basename(imd_info.imd_file))[0]
+                if imd_base_name not in shp_paths:
+                    logger.warn("Base name %s missing from GIS_FILES" % imd_base_name)
+                else:
+                    band_info[imd_info.band_id] = imd_info
+                    band_shps[imd_info.band_id] = shp_paths[imd_base_name]
 
             # Submit job
             worker_pool.submit(worker_thread,
-                               part_num,
-                               band_dirs,
+                               gen_base_name,
                                band_info,
                                band_shps,
                                target_srs,
@@ -478,12 +487,18 @@ def gdal_ortho(input_dir,
                         fail_msg="Failed to create band %s VRT %s" % (band_alias, vrt_name),
                         cwd=output_dir)
 
+        # Stage output to S3 if necessary
+        if s3_output_prefix is not None:
+            run_cmd(["aws", "s3", "sync", output_dir, s3_output_prefix],
+                    fail_msg="Failed to upload output %s to %s" % \
+                    (output_dir, s3_output_prefix),
+                    cwd=output_dir)
+
     finally:
         # Delete the temporary directory and its contents
         shutil.rmtree(temp_dir)
 
-def worker_thread(part_num,
-                  band_dirs,
+def worker_thread(base_name,
                   band_info,
                   band_shps,
                   target_srs,
@@ -505,9 +520,7 @@ def worker_thread(part_num,
     """Orthorectifies a 1B part using GDAL utilities.
 
     Args:
-        part_num: Part number.
-        band_dirs: Dictionary containing directory paths for each band
-            in the part.
+        base_name: Name of the image(s) to be processed.
         band_info: Tuples generated from __parse_imd for each band in
             the part.
         band_shps: Paths to shapefiles for each band in the part.
@@ -541,10 +554,10 @@ def worker_thread(part_num,
 
     # Loop over bands
     dem_chip = None
-    for (band, band_input_dir) in band_dirs.iteritems():
-        logger.info("Processing part P%03d band %s" % (part_num, band))
+    for (band, info) in band_info.iteritems():
+        logger.info("Processing %s %s" % (base_name, band))
         shp_filename = band_shps[band]
-        imd_filename = band_info[band].imd_file
+        imd_filename = info.imd_file
         xml_filename = os.path.splitext(imd_filename)[0] + ".XML"
         band_pixel_size = band_pixel_sizes[band]
 
@@ -577,8 +590,8 @@ def worker_thread(part_num,
             # intersection, there's no work to be done for this part.
             band_geom_srs = band_geom_srs.intersection(aoi_geom)
             if band_geom_srs.area == 0:
-                logger.info("Part P%03d band %s does not intersect AOI" % \
-                            (part_num, band))
+                logger.info("%s %s does not intersect AOI" % \
+                            (base_name, band))
                 continue
 
         # Calculate the extents to use given the ortho grid
@@ -596,34 +609,41 @@ def worker_thread(part_num,
         max_extent_x = grid_origin[0] + (max_pix_x * band_pixel_size)
         max_extent_y = grid_origin[1] + (max_pix_y * band_pixel_size)
 
-        # Find all TIFs in the input directory
-        tif_list = [os.path.join(band_input_dir, f)
-                    for f in os.listdir(band_input_dir)
-                    if f.lower().endswith(".tif")]
+        # Find the TIF corresponding to the IMD
+        input_dir = os.path.dirname(imd_filename)
+        imd_basename = os.path.splitext(os.path.basename(imd_filename))[0]
+        tif_list = [os.path.join(input_dir, f)
+                    for f in os.listdir(input_dir)
+                    if f.lower().endswith(".tif") and \
+                    os.path.splitext(os.path.basename(f))[0] == imd_basename]
+        if len(tif_list) != 1:
+            logger.warn("Found %d TIFs corresponding to IMD file %s, expected 1" % \
+                        (len(tif_list), imd_filename))
+        else:
+            tif_filename = tif_list[0]
 
-        # Check whether DEM is available
-        if os.path.exists(rpc_dem):
-            # Get the DEM chip if it hasn't already been created
-            if dem_chip is None:
-                dem_chip = dem.local_dem_chip(os.path.basename(band_input_dir),
-                                              temp_dir,
-                                              band_geom,
-                                              rpc_dem,
-                                              apply_geoid,
-                                              gdal_cachemax,
-                                              warp_memsize,
-                                              warp_threads,
-                                              DEM_CHIP_MARGIN_DEG)
+            # Check whether DEM is available
+            if os.path.exists(rpc_dem):
+                # Get the DEM chip if it hasn't already been created
+                if dem_chip is None:
+                    dem_chip = dem.local_dem_chip(base_name,
+                                                  temp_dir,
+                                                  band_geom,
+                                                  rpc_dem,
+                                                  apply_geoid,
+                                                  gdal_cachemax,
+                                                  warp_memsize,
+                                                  warp_threads,
+                                                  DEM_CHIP_MARGIN_DEG)
 
-            # Orthorectify all TIFs in the input directory
-            for input_file in tif_list:
+                # Orthorectify TIF
                 logger.info("Orthorectifying %s to SRS %s using pixel size %.10f" % \
-                            (input_file, target_srs, band_pixel_size))
+                            (tif_filename, target_srs, band_pixel_size))
 
                 # Get path of TIF relative to input_dir. This provides
                 # the path below output_dir to use for the output
                 # file.
-                tif_rel_path = os.path.relpath(input_file, input_dir)
+                tif_rel_path = os.path.relpath(tif_filename, input_dir)
                 output_file = __update_filename(os.path.join(output_dir, tif_rel_path))
                 output_file_dir = os.path.dirname(output_file)
                 if not os.path.isdir(output_file_dir):
@@ -642,11 +662,11 @@ def worker_thread(part_num,
                 args += ["-to", "RPC_DEM=%s" % dem_chip]
                 args += ["-to", "RPC_DEMINTERPOLATION=bilinear"]
                 args += ["-co", "TILED=YES"]
-                args += [input_file]
+                args += [tif_filename]
                 args += [output_file]
                 run_cmd(args,
                         fail_msg="Failed to orthorectify %s using DEM %s" % \
-                        (input_file, dem_chip),
+                        (tif_filename, dem_chip),
                         cwd=temp_dir)
 
                 # Copy the input file's IMD to the output
@@ -662,17 +682,15 @@ def worker_thread(part_num,
                     shutil.copy(xml_filename, updated_xml_filename)
                     __update_product_level(updated_xml_filename)
 
-        else: # rpc_dem does not exist
-            # Orthorectify all TIFs in the input directory using
-            # average height above ellipsoid
-            for input_file in tif_list:
+            else: # rpc_dem does not exist
+                # Orthorectify TIF using average height above ellipsoid
                 logger.info("Orthorectifying %s to SRS %s using pixel size %.10f" % \
-                            (input_file, target_srs, band_pixel_size))
+                            (tif_filename, target_srs, band_pixel_size))
 
                 # Get path of TIF relative to input_dir. This provides
                 # the path below output_dir to use for the output
                 # file.
-                tif_rel_path = os.path.relpath(input_file, input_dir)
+                tif_rel_path = os.path.relpath(tif_filename, input_dir)
                 output_file = __update_filename(os.path.join(output_dir, tif_rel_path))
                 output_file_dir = os.path.dirname(output_file)
                 if not os.path.isdir(output_file_dir):
@@ -690,11 +708,11 @@ def worker_thread(part_num,
                 args += ["-wo", "NUM_THREADS=%s" % warp_threads]
                 args += ["-to", "RPC_HEIGHT=%s" % avg_hae]
                 args += ["-co", "TILED=YES"]
-                args += [input_file]
+                args += [tif_filename]
                 args += [output_file]
                 run_cmd(args,
                         fail_msg="Failed to orthorectify %s using average height %.10f" % \
-                        (input_file, avg_hae),
+                        (tif_filename, avg_hae),
                         cwd=temp_dir)
 
                 # Copy the input file's IMD to the output
@@ -708,7 +726,25 @@ def worker_thread(part_num,
                                 __update_filename(os.path.join(output_file_dir,
                                                                os.path.basename(xml_filename))))
 
+def __get_general_basename(filename):
+    """Returns the basename of a file without band info.
+
+    Args:
+        filename: Filename to be parsed.
+
+    Returns the basename of the provided filename with out band
+    information, e.g. M1BS, P1BS, etc.
+
+    """
+
+    base_name = os.path.splitext(os.path.basename(filename))[0]
+    m_obj = re.search(r"[_\-](\w1bs)[_\-]", base_name, flags=re.IGNORECASE)
+    if m_obj is not None:
+        base_name = base_name.replace(m_obj.group(1), "x" * len(m_obj.group(1)))
+    return base_name
+
 def __parse_imd(imd_file):
+
     """Parses an IMD file for metadata.
 
     Args:

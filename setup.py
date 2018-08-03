@@ -5,6 +5,7 @@ setup(name="gdal_ortho",
       packages=find_packages(exclude=["test*"]),
       package_data={"gdal_ortho": ["data/*"]},
       install_requires=[
+          "awscli",
           "boto3",
           "Click",
           "fiona",
