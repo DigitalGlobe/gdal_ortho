@@ -1,0 +1,6 @@
+data_classification:
+  - company_proprietary
+
+poc:
+  - name: Tim Harris
+    email: Tim.Harris@maxar.com
